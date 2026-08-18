@@ -5,6 +5,8 @@ const { PALABRA_WS, PALABRA_AUDIO_FORMAT } = require('./config');
 
 const POLL_MS = 2100;
 const MAX_POLLS = 5;
+const MAX_RECONNECT = 3;
+const RECONNECT_DELAYS_MS = [500, 1500, 4000];
 
 /**
  * Builds the Palabra speech-to-speech WebSocket endpoint URL.
@@ -77,7 +79,7 @@ const buildSetTaskMessage = ({ sourceLanguage, targetLanguage }) => ({
 /**
  * Opens a Palabra speech-to-speech session over WebSocket.
  * @param {{ sourceLanguage: string, targetLanguage: string, onOutputAudio?: Function, onError?: Function }} params
- * @returns {{ sendAudio: Function, pause: Function, resume: Function, end: Function }}
+ * @returns {{ sendAudio: Function, pause: Function, resume: Function, forceClose: Function, end: Function }}
  */
 const createSession = ({ sourceLanguage, targetLanguage, onOutputAudio, onError }) => {
   const noop = {
@@ -104,17 +106,13 @@ const createSession = ({ sourceLanguage, targetLanguage, onOutputAudio, onError 
   }
 
   let ws;
-  try {
-    ws = new WebSocket(buildEndpoint());
-  } catch (err) {
-    fail(err);
-    return noop;
-  }
-
   let open = false;
   let ready = false;
+  let ended = false;
   let pollTimer;
+  let reconnectTimer;
   let polls = 0;
+  let reconnectAttempts = 0;
 
   const send = (msg) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -131,9 +129,16 @@ const createSession = ({ sourceLanguage, targetLanguage, onOutputAudio, onError 
     pollTimer = undefined;
   };
 
+  const stopReconnect = () => {
+    if (!reconnectTimer) return;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+  };
+
   const markReady = () => {
     if (ready) return;
     ready = true;
+    reconnectAttempts = 0;
     stopPoll();
     logger.info('[palabra] task ready', { sourceLanguage, targetLanguage });
   };
@@ -156,88 +161,137 @@ const createSession = ({ sourceLanguage, targetLanguage, onOutputAudio, onError 
     pollTimer = setInterval(poll, POLL_MS);
   };
 
-  ws.on('open', () => {
-    open = true;
-    logger.info('[palabra] ws open', { sourceLanguage, targetLanguage });
-    startTask();
-  });
+  /**
+   * Opens (or re-opens) the Palabra streaming WebSocket and binds handlers.
+   */
+  const connect = () => {
+    if (ended) return;
 
-  ws.on('message', (raw) => {
-    let msg;
     try {
-      msg = JSON.parse(raw.toString());
+      ws = new WebSocket(buildEndpoint());
     } catch (err) {
-      logger.warn('[palabra] non-json message', { error: err.message });
+      fail(err);
       return;
     }
 
-    if (typeof msg.data === 'string') {
+    ws.on('open', () => {
+      if (ended) return;
+      open = true;
+      logger.info('[palabra] ws open', {
+        sourceLanguage,
+        targetLanguage,
+        reconnectAttempts,
+      });
+      startTask();
+    });
+
+    ws.on('message', (raw) => {
+      let msg;
       try {
-        msg.data = JSON.parse(msg.data);
+        msg = JSON.parse(raw.toString());
       } catch (err) {
-        logger.warn('[palabra] bad data string', { error: err.message, type: msg.message_type });
+        logger.warn('[palabra] non-json message', { error: err.message });
         return;
       }
-    }
 
-    switch (msg.message_type) {
-      case 'current_task':
-        markReady();
-        break;
-
-      case 'output_audio_data': {
-        const audio = msg.data && msg.data.data;
-        if (!audio) {
-          logger.warn('[palabra] empty output_audio_data');
-          break;
+      if (typeof msg.data === 'string') {
+        try {
+          msg.data = JSON.parse(msg.data);
+        } catch (err) {
+          logger.warn('[palabra] bad data string', { error: err.message, type: msg.message_type });
+          return;
         }
-        if (typeof onOutputAudio === 'function') {
-          onOutputAudio({
-            transcriptionId: msg.data.transcription_id,
-            base64Audio: audio,
-            lastChunk: !!msg.data.last_chunk,
-          });
-        }
-        break;
       }
 
-      case 'translated_transcription':
-        logger.info('[palabra] translated text', {
-          sourceLanguage,
-          targetLanguage,
-          text: msg.data && msg.data.transcription && msg.data.transcription.text,
-          language: msg.data && msg.data.transcription && msg.data.transcription.language,
-        });
-        break;
+      switch (msg.message_type) {
+        case 'current_task':
+          markReady();
+          break;
 
-      case 'warning':
-        logger.warn('[palabra] warning', msg.data);
-        break;
-
-      case 'error':
-        if (msg.data && msg.data.code === 'NOT_FOUND') {
-          logger.warn('[palabra] NOT_FOUND (ignored)', {
-            sourceLanguage,
-            targetLanguage,
-            ready,
-            desc: msg.data.desc || msg.data.msg,
-          });
-          if (ready) startTask();
+        case 'output_audio_data': {
+          const audio = msg.data && msg.data.data;
+          if (!audio) {
+            logger.warn('[palabra] empty output_audio_data');
+            break;
+          }
+          if (typeof onOutputAudio === 'function') {
+            onOutputAudio({
+              transcriptionId: msg.data.transcription_id,
+              base64Audio: audio,
+              lastChunk: !!msg.data.last_chunk,
+            });
+          }
           break;
         }
-        fail(new Error(`Palabra error ${msg.data.code}: ${msg.data.desc || msg.data.msg || ''}`));
-        break;
 
-      default:
-        break;
-    }
-  });
+        case 'translated_transcription':
+          logger.info('[palabra] translated text', {
+            sourceLanguage,
+            targetLanguage,
+            text: msg.data && msg.data.transcription && msg.data.transcription.text,
+            language: msg.data && msg.data.transcription && msg.data.transcription.language,
+          });
+          break;
 
-  ws.on('error', fail);
-  ws.on('close', () => {
-    open = false;
-    stopPoll();
-  });
+        case 'warning':
+          logger.warn('[palabra] warning', msg.data);
+          break;
+
+        case 'error':
+          if (msg.data && msg.data.code === 'NOT_FOUND') {
+            logger.warn('[palabra] NOT_FOUND (ignored)', {
+              sourceLanguage,
+              targetLanguage,
+              ready,
+              desc: msg.data.desc || msg.data.msg,
+            });
+            if (ready) startTask();
+            break;
+          }
+          fail(new Error(`Palabra error ${msg.data.code}: ${msg.data.desc || msg.data.msg || ''}`));
+          break;
+
+        default:
+          break;
+      }
+    });
+
+    ws.on('error', (err) => {
+      if (ended) return;
+      logger.warn('[palabra] ws error', { error: err.message, sourceLanguage, targetLanguage });
+    });
+
+    ws.on('close', () => {
+      open = false;
+      ready = false;
+      stopPoll();
+      if (ended) return;
+
+      if (reconnectAttempts >= MAX_RECONNECT) {
+        logger.error('[palabra] ws closed, retries exhausted — call continues without translation', {
+          sourceLanguage,
+          targetLanguage,
+          reconnectAttempts,
+        });
+        fail(new Error('Palabra WebSocket closed; retries exhausted'));
+        return;
+      }
+
+      const delay = RECONNECT_DELAYS_MS[reconnectAttempts] || 4000;
+      reconnectAttempts += 1;
+      logger.warn('[palabra] ws closed, reconnecting', {
+        sourceLanguage,
+        targetLanguage,
+        attempt: reconnectAttempts,
+        max: MAX_RECONNECT,
+        delayMs: delay,
+      });
+      stopReconnect();
+      reconnectTimer = setTimeout(connect, delay);
+    });
+  };
+
+  connect();
 
   return {
     // drop frames until current_task — buffering them blows AUDIO_STREAM_TOO_FAST
@@ -251,11 +305,24 @@ const createSession = ({ sourceLanguage, targetLanguage, onOutputAudio, onError 
       send({ message_type: 'pause_task', data: {} });
     },
     resume: startTask,
-    end: () => {
-      stopPoll();
-      send({ message_type: 'end_task', data: {} });
+    /**
+     * Lab/QA helper: drop the Palabra socket without ending the session so reconnect runs.
+     */
+    forceClose: () => {
+      if (!ws) return;
       try {
         ws.close();
+      } catch (e) {
+        // already closed
+      }
+    },
+    end: () => {
+      ended = true;
+      stopPoll();
+      stopReconnect();
+      send({ message_type: 'end_task', data: {} });
+      try {
+        if (ws) ws.close();
       } catch (e) {
         // already closed
       }

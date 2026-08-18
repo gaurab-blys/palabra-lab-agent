@@ -104,6 +104,12 @@ const removeByCallSid = (callSid) => {
   if (pairId) removePair(pairId);
 };
 
+/**
+ * Returns every live call pair.
+ * @returns {object[]}
+ */
+const listPairs = () => [...pairs.values()];
+
 const registry = {
   registerPair,
   attachLeg,
@@ -116,6 +122,7 @@ const registry = {
   },
   remove: removeByCallSid,
   removePair,
+  listPairs,
 };
 
 module.exports = {
@@ -126,5 +133,6 @@ module.exports = {
   getByCall,
   resolveRoleFromCallSid,
   removeByCallSid,
+  listPairs,
   registry,
 };

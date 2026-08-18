@@ -32,6 +32,23 @@
         opacity: 0.5;
         cursor: not-allowed;
       }
+      .row {
+        display: flex;
+        gap: 0.5rem;
+      }
+      .row button {
+        flex: 1;
+        margin-top: 0.5rem;
+      }
+      button.secondary {
+        background: #fff;
+        border: 1px solid #ccc;
+      }
+      button.muted {
+        background: #1f2937;
+        color: #fff;
+        border-color: #1f2937;
+      }
       #status {
         margin-top: 1rem;
         padding: 0.75rem;
@@ -60,6 +77,13 @@
     <button id="callBtn" type="button" disabled>Call client</button>
     <button id="hangupBtn" type="button" disabled>Hang up</button>
 
+    <div class="row">
+      <button id="muteBtn" class="secondary" type="button" disabled>Mute mic</button>
+      <button id="interruptBtn" class="secondary" type="button" disabled>
+        Interrupt Palabra
+      </button>
+    </div>
+
     <div id="status">Loading…</div>
 
     <p class="hint">
@@ -73,6 +97,8 @@
       const statusEl = document.getElementById('status');
       const callBtn = document.getElementById('callBtn');
       const hangupBtn = document.getElementById('hangupBtn');
+      const muteBtn = document.getElementById('muteBtn');
+      const interruptBtn = document.getElementById('interruptBtn');
       const callerInput = document.getElementById('caller');
       const clientInput = document.getElementById('client');
 
@@ -85,6 +111,17 @@
 
       const setStatus = (msg) => {
         statusEl.textContent = msg;
+      };
+
+      const setInCall = (on) => {
+        callBtn.disabled = on;
+        hangupBtn.disabled = !on;
+        muteBtn.disabled = !on;
+        interruptBtn.disabled = !on;
+        if (!on) {
+          muteBtn.textContent = 'Mute mic';
+          muteBtn.classList.remove('muted');
+        }
       };
 
       const setupDevice = async () => {
@@ -123,13 +160,11 @@
         setStatus('Connecting…');
         try {
           activeCall = await device.connect({ params: { To, From } });
-          callBtn.disabled = true;
-          hangupBtn.disabled = false;
+          setInCall(true);
           setStatus('Connected — client phone should ring.');
           activeCall.on('disconnect', () => {
             activeCall = null;
-            callBtn.disabled = false;
-            hangupBtn.disabled = true;
+            setInCall(false);
             setStatus('Call ended.');
           });
         } catch (err) {
@@ -139,6 +174,43 @@
 
       hangupBtn.addEventListener('click', () => {
         if (activeCall) activeCall.disconnect();
+      });
+
+      muteBtn.addEventListener('click', () => {
+        if (!activeCall) return;
+        const next = !activeCall.isMuted();
+        activeCall.mute(next);
+        muteBtn.textContent = next ? 'Unmute mic' : 'Mute mic';
+        muteBtn.classList.toggle('muted', next);
+        setStatus(
+          next
+            ? 'Mic muted — Palabra should stop getting your English.'
+            : 'Mic unmuted.'
+        );
+      });
+
+      interruptBtn.addEventListener('click', async () => {
+        if (!activeCall) return;
+        interruptBtn.disabled = true;
+        try {
+          const res = await fetch('/debug/drop-palabra?role=agent', { method: 'POST' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            setStatus('Interrupt failed: ' + (data.error || res.status));
+            return;
+          }
+          if (!data.dropped || !data.dropped.length) {
+            setStatus('No Palabra session to interrupt yet (wait for the media stream).');
+            return;
+          }
+          setStatus(
+            'Palabra interrupted — watch logs for reconnect or fail-open. Call stays up.'
+          );
+        } catch (err) {
+          setStatus('Interrupt failed: ' + err.message);
+        } finally {
+          interruptBtn.disabled = !activeCall;
+        }
       });
 
       setupDevice().catch((err) => setStatus(err.message));

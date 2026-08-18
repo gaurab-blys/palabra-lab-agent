@@ -87,6 +87,8 @@ npm run call -- --to +977CLIENT --test-ring
 | `[palabra] translated text` | ASR + translation text from Palabra |
 | `[latency] palabra` | `palabraMs` and `e2eMs` per utterance |
 | `[stream] peer not ready, dropping TTS` | Peer leg not connected yet — usually transient |
+| `[palabra] ws closed, reconnecting` | Palabra socket dropped; retry with backoff |
+| `[palabra] ws closed, retries exhausted` | Translation off; **Twilio call stays up** |
 
 Example latency line:
 
@@ -105,6 +107,31 @@ Edit `.env` or Palabra session config in `src/palabraSession.js`:
 | `PALABRA_AUDIO_FORMAT.chunkMs` in config | `320` | μ-law buffer before sending to Palabra |
 | `segment_confirmation_silence_threshold` | `0.5` | Lower = faster TTS start, may cut phrases |
 | `translate_partial_transcriptions` | `false` | `true` = faster but choppier TTS |
+
+## Interrupt Palabra WebSocket (TC-06)
+
+If Palabra’s streaming socket drops mid-call, the lab **reconnects** (500ms → 1.5s → 4s, max 3 attempts) and re-sends `set_task`. Audio is dropped until `current_task` again. After retries are exhausted, translation stops and the **Twilio call stays up** (`[stream] session error (call continues)`).
+
+This is **not** in blysnode today (`palabraWs.js` close handler only stops polling). The lab is the place to prove the behavior before porting.
+
+### Live QA
+
+1. Place a call from `/agent` and wait until both legs are paired and you hear translation.
+2. On the agent page, use **Interrupt Palabra** (drops the agent Palabra socket; call stays up). Or from a terminal:
+
+```bash
+# Drop both legs (or ?role=agent / ?role=client)
+curl -X POST "http://localhost:4000/debug/drop-palabra?role=both"
+```
+
+**Mute mic** on `/agent` mutes the browser microphone via the Twilio Voice SDK — Palabra should stop receiving English until you unmute.
+
+3. Watch logs:
+
+- **Pass (reconnect):** `[palabra] ws closed, reconnecting` → `[palabra] ws open` → `[palabra] task ready` → `[palabra] translated text` resumes.
+- **Pass (fail open):** `[palabra] ws closed, retries exhausted — call continues without translation` — phones stay connected, no crash. Repeat the curl 4 times quickly to exhaust retries.
+
+Do **not** hang up from `/agent` during this test — that calls `end()` and must **not** reconnect.
 
 ## Tests
 

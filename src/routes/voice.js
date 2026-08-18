@@ -3,12 +3,41 @@ const path = require('path');
 const logger = require('../logger');
 const { startOutboundPair } = require('../outboundCall');
 const { getVoiceToken } = require('../voiceToken');
+const { listPairs } = require('../pairRegistry');
 const { VOICE_WEBHOOK_PATH, VOICE_STATUS_PATH } = require('../config');
 
 const router = express.Router();
 
 router.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'palabra-twilio-lab' });
+});
+
+/**
+ * QA helper for TC-06: drop Palabra WebSocket(s) on the live call without hanging up Twilio.
+ * The session reconnects (up to 3 times) or fails open — the phone call stays up.
+ *
+ * POST /debug/drop-palabra?role=agent|client|both
+ */
+router.post('/debug/drop-palabra', (req, res) => {
+  const role = String(req.query.role || 'both');
+  if (!['agent', 'client', 'both'].includes(role)) {
+    res.status(400).json({ error: 'role must be agent, client, or both' });
+    return;
+  }
+
+  const dropped = [];
+  listPairs().forEach((pair) => {
+    ['agent', 'client'].forEach((leg) => {
+      if (role !== 'both' && role !== leg) return;
+      const session = pair[leg] && pair[leg].session;
+      if (!session || typeof session.forceClose !== 'function') return;
+      session.forceClose();
+      dropped.push({ pairId: pair.pairId, role: leg, callSid: pair[leg].callSid });
+    });
+  });
+
+  logger.warn('[debug] Palabra WebSocket force-closed', { role, dropped });
+  res.json({ ok: true, role, dropped });
 });
 
 /** Built-in browser agent (standalone — no NAP required). */

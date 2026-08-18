@@ -321,15 +321,37 @@ const handleConnection = (ws) => {
   };
 
   const cleanup = () => {
+    // Palabra session for this specific leg is tied to this media stream WS,
+    // so when the media stream ends we stop only this leg's session.
     if (state.session) state.session.end();
 
     const pair = state.pairId ? getPair(state.pairId) : undefined;
-    if (!pair) {
-      if (state.callSid) removeByCallSid(state.callSid);
-      return;
-    }
+    if (!pair) return;
 
     const peer = state.role === 'agent' ? pair.client : pair.agent;
+
+    // Clear the closed leg's WS + stream metadata but keep the pair as long as the peer
+    // media stream is still connected. This mirrors the "separate legs" behavior from
+    // conversationrelay-translation-lab.
+    try {
+      attachLeg(state.pairId, state.role, {
+        ws: undefined,
+        streamSid: undefined,
+        session: undefined,
+      });
+    } catch (_e) {
+      // Non-fatal: cleanup continues.
+    }
+
+    const peerWsAlive =
+      peer?.ws &&
+      peer.ws.readyState === WS_OPEN &&
+      peer.streamSid;
+
+    // If the peer leg is still alive, keep the call up and let the peer continue translating.
+    if (peerWsAlive) return;
+
+    // If both legs are down (or the peer is down too), finish the whole pair.
     if (peer?.session) peer.session.end();
     hangUp(peer?.callSid);
     removePair(state.pairId);

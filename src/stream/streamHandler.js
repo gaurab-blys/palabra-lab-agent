@@ -342,11 +342,7 @@ const handleConnection = (ws) => {
     const opposite = getOppositeLegByCallSid(state.callSid);
     detachLegByCallSid(state.callSid);
 
-    const peerWsAlive =
-      opposite?.ws && opposite.ws.readyState === WS_OPEN && opposite.streamSid;
-
-    if (peerWsAlive) return;
-
+    // Either party hanging up ends the whole translation pair.
     if (opposite?.session) opposite.session.end();
     hangUp(opposite?.callSid);
     if (state.pairId) removePair(state.pairId);

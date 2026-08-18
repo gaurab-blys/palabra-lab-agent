@@ -7,6 +7,13 @@ const mockCalls = Object.assign(
   }
 );
 
+const mockHangUp = jest.fn().mockResolvedValue(undefined);
+
+jest.mock('../src/voice/outboundCall', () => {
+  const actual = jest.requireActual('../src/voice/outboundCall');
+  return { ...actual, hangUp: (...args) => mockHangUp(...args) };
+});
+
 jest.mock('../src/twilioClient', () => ({
   twilioClient: { calls: mockCalls },
 }));
@@ -56,6 +63,7 @@ describe('mediaStream', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockHangUp.mockClear();
     registry.removePair('PAIR1');
   });
 
@@ -276,6 +284,29 @@ describe('mediaStream', () => {
     );
 
     expect(mockSession.sendAudio).not.toHaveBeenCalled();
+  });
+
+  it('hangs up the agent leg when the client disconnects', () => {
+    const agentWs = createFakeWs();
+    const clientWs = createFakeWs();
+    registry.registerPair('PAIR1', { agentCallSid: 'CA_AGENT', clientCallSid: 'CA_CLIENT' });
+    handleConnection(agentWs);
+    handleConnection(clientWs);
+
+    agentWs.emit(
+      'message',
+      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ_AGENT', pairId: 'PAIR1', role: 'agent' })
+    );
+    clientWs.emit(
+      'message',
+      startEvent({ callSid: 'CA_CLIENT', streamSid: 'MZ_CLIENT', pairId: 'PAIR1', role: 'client' })
+    );
+
+    mockHangUp.mockClear();
+    clientWs.emit('close');
+
+    expect(mockHangUp).toHaveBeenCalledWith('CA_AGENT');
+    expect(registry.getPair('PAIR1')).toBeUndefined();
   });
 
   it('ends the Palabra session and clears the pair when the only leg disconnects', () => {

@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Palabra Lab — Agent</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 480px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      label {
+        display: block;
+        margin-top: 1rem;
+        font-weight: 600;
+      }
+      input,
+      button {
+        width: 100%;
+        box-sizing: border-box;
+        margin-top: 0.35rem;
+        padding: 0.65rem;
+        font-size: 1rem;
+      }
+      button {
+        cursor: pointer;
+        margin-top: 1rem;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      #status {
+        margin-top: 1rem;
+        padding: 0.75rem;
+        background: #f4f4f4;
+        border-radius: 6px;
+        min-height: 3rem;
+      }
+      .hint {
+        color: #555;
+        font-size: 0.9rem;
+        margin-top: 1.5rem;
+      }
+    </style>
+    <script src="/vendor/twilio.min.js"></script>
+  </head>
+  <body>
+    <h1>Palabra Lab Agent</h1>
+    <p>Speak here in the browser — the client phone will ring.</p>
+
+    <label for="caller">Caller number (Twilio)</label>
+    <input id="caller" type="tel" placeholder="+19189194048" />
+
+    <label for="client">Client number</label>
+    <input id="client" type="tel" placeholder="+9779702005057" />
+
+    <button id="callBtn" type="button" disabled>Call client</button>
+    <button id="hangupBtn" type="button" disabled>Hang up</button>
+
+    <div id="status">Loading…</div>
+
+    <p class="hint">
+      TwiML App voice URL must be
+      <code>WEBHOOK_BASE_URL/api/v2/webhook/twilio/voice</code>
+    </p>
+
+    <script>
+      const Device = Twilio.Device;
+
+      const statusEl = document.getElementById('status');
+      const callBtn = document.getElementById('callBtn');
+      const hangupBtn = document.getElementById('hangupBtn');
+      const callerInput = document.getElementById('caller');
+      const clientInput = document.getElementById('client');
+
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('caller')) callerInput.value = params.get('caller');
+      if (params.get('client')) clientInput.value = params.get('client');
+
+      let device;
+      let activeCall;
+
+      const setStatus = (msg) => {
+        statusEl.textContent = msg;
+      };
+
+      const setupDevice = async () => {
+        const res = await fetch('/api/voice-token');
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          setStatus(
+            err.error ||
+              'Voice token failed — set TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_VOICE_TWIML_APP_SID'
+          );
+          return;
+        }
+
+        const { token } = await res.json();
+        device = new Device(token, { closeProtection: true });
+
+        device.on(Device.EventName.Registered, () => {
+          setStatus('Ready — click Call client.');
+          callBtn.disabled = false;
+        });
+
+        device.on(Device.EventName.Error, (err) => {
+          setStatus('Device error: ' + err.message);
+        });
+
+        device.register();
+      };
+
+      callBtn.addEventListener('click', async () => {
+        const From = callerInput.value.trim();
+        const To = clientInput.value.trim();
+        if (!From || !To) {
+          setStatus('Enter both numbers.');
+          return;
+        }
+        setStatus('Connecting…');
+        try {
+          activeCall = await device.connect({ params: { To, From } });
+          callBtn.disabled = true;
+          hangupBtn.disabled = false;
+          setStatus('Connected — client phone should ring.');
+          activeCall.on('disconnect', () => {
+            activeCall = null;
+            callBtn.disabled = false;
+            hangupBtn.disabled = true;
+            setStatus('Call ended.');
+          });
+        } catch (err) {
+          setStatus('Connect failed: ' + err.message);
+        }
+      });
+
+      hangupBtn.addEventListener('click', () => {
+        if (activeCall) activeCall.disconnect();
+      });
+
+      setupDevice().catch((err) => setStatus(err.message));
+    </script>
+  </body>
+</html>

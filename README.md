@@ -147,9 +147,10 @@ Unit tests mock Twilio and Palabra — no live API calls.
 |----------|-----------------|
 | `src/audio.js` | `voiceTranslation/audio.js` |
 | `src/palabraSession.js` | `voiceTranslation/palabraWs.js` |
-| `src/pairRegistry.js` | `voiceTranslation/palabra.js` (registry section) |
-| `src/mediaStream.js` | `voiceTranslation/palabra.js` (`handleConnection`) |
-| `src/outboundCall.js` | `voiceTranslation/palabra.js` (`buildCallTwiml`) |
+| `src/stream/sessionStore.js` | `voiceTranslation/palabra.js` (registry section) |
+| `src/stream/streamHandler.js` | `voiceTranslation/palabra.js` (`handleConnection`) |
+| `src/voice/twiml.js` | `voiceTranslation/palabra.js` (`buildCallTwiml`) |
+| `src/voice/outboundCall.js` | `voiceTranslation/palabra.js` (outbound dial) |
 | `src/routes/voice.js` | `twilioWebhook.service.js` outbound hook |
 
 **Intentionally omitted** (out of scope):

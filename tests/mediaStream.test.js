@@ -39,13 +39,18 @@ describe('mediaStream', () => {
     };
   };
 
-  const startEvent = ({ callSid, streamSid, pairId, role }) =>
+  const startEvent = ({ callSid, streamSid, pairId, role, sourceLanguage, targetLanguage }) =>
     JSON.stringify({
       event: 'start',
       start: {
         callSid,
         streamSid,
-        customParameters: { pairId, role },
+        customParameters: {
+          pairId,
+          role,
+          ...(sourceLanguage ? { sourceLanguage } : {}),
+          ...(targetLanguage ? { targetLanguage } : {}),
+        },
       },
     });
 
@@ -72,22 +77,23 @@ describe('mediaStream', () => {
     expect(registry.get('CA_AGENT').session).toBe(mockSession);
   });
 
-  it('resolves role from CallSid when customParameters disagree', () => {
+  it('uses explicit sourceLanguage/targetLanguage from customParameters', () => {
     const ws = createFakeWs();
     handleConnection(ws);
-    registry.registerPair('PAIR1', { agentCallSid: 'CA_AGENT', clientCallSid: 'CA_CLIENT' });
     ws.emit(
       'message',
       startEvent({
         callSid: 'CA_AGENT',
         streamSid: 'MZ1',
         pairId: 'PAIR1',
-        role: 'client',
+        role: 'agent',
+        sourceLanguage: 'fr',
+        targetLanguage: 'de',
       })
     );
 
     expect(createSession).toHaveBeenCalledTimes(1);
-    expect(capturedSessionArgs).toMatchObject({ sourceLanguage: 'en', targetLanguage: 'hi' });
+    expect(capturedSessionArgs).toMatchObject({ sourceLanguage: 'fr', targetLanguage: 'de' });
   });
 
   it('ignores a start message without pairId/role', () => {
@@ -272,7 +278,7 @@ describe('mediaStream', () => {
     expect(mockSession.sendAudio).not.toHaveBeenCalled();
   });
 
-  it('ends the Palabra session and clears the pair on close', () => {
+  it('ends the Palabra session and clears the pair when the only leg disconnects', () => {
     const ws = createFakeWs();
     handleConnection(ws);
     ws.emit(

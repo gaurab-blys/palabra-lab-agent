@@ -7,7 +7,7 @@ const mockCalls = Object.assign(
   }
 );
 
-jest.mock('../src/twilioClient', () => ({
+jest.mock('../src/voice/twilioClient', () => ({
   twilioClient: { calls: mockCalls },
 }));
 

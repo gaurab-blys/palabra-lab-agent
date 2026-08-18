@@ -1,9 +1,9 @@
 const express = require('express');
 const path = require('path');
 const logger = require('../logger');
-const { startOutboundPair } = require('../outboundCall');
+const { startOutboundPair } = require('../voice/outboundCall');
 const { getVoiceToken } = require('../voiceToken');
-const { listPairs } = require('../pairRegistry');
+const { listPairs } = require('../stream/sessionStore');
 const { VOICE_WEBHOOK_PATH, VOICE_STATUS_PATH } = require('../config');
 
 const router = express.Router();

@@ -7,7 +7,7 @@ const {
   getLegByCallSid,
   removePair,
 } = require('../stream/sessionStore');
-const { LANGUAGE_PAIRS } = require('../config');
+const { LANGUAGE_PAIRS, getVoiceStatusUrl } = require('../config');
 
 const DIAL_TIMEOUT_MS = 35000;
 
@@ -39,6 +39,7 @@ const startOutboundPair = async ({ from, to, agentCallSid }) => {
   }
 
   const pairId = crypto.randomUUID();
+  const statusCallback = getVoiceStatusUrl();
 
   let peerCall;
   try {
@@ -52,6 +53,9 @@ const startOutboundPair = async ({ from, to, agentCallSid }) => {
         langPreset: 'client',
         playback: 'twilio',
       }),
+      statusCallback,
+      statusCallbackEvent: ['completed', 'busy', 'no-answer', 'canceled', 'failed'],
+      statusCallbackMethod: 'POST',
     });
   } catch (err) {
     logger.error('[outbound] client dial failed', { error: err.message });

@@ -232,24 +232,14 @@ describe('mediaStream', () => {
     expect(agentWs.send).not.toHaveBeenCalled();
   });
 
-  it('ends the Palabra session and clears the pair when the only leg disconnects', () => {
-    const ws = createFakeWs();
-    handleConnection(ws);
-    ws.emit(
-      'message',
-      startEvent({
-        callSid: 'CA_AGENT',
-        streamSid: 'MZ1',
-        pairId: 'PAIR1',
-        peerCallSid: 'CA_CLIENT',
-        playback: 'browser',
-        sourceLanguage: 'en',
-        targetLanguage: 'hi',
-      })
-    );
+  it('hangs up the peer leg when one media stream disconnects', () => {
+    const { agentWs, clientWs } = pairBothLegs();
 
-    ws.emit('close');
-    expect(mockSession.end).toHaveBeenCalled();
+    clientWs.emit('close');
+
+    expect(mockCalls).toHaveBeenCalledWith('CA_AGENT');
+    expect(mockUpdate).toHaveBeenCalledWith({ status: 'completed' });
     expect(registry.getPair('PAIR1')).toBeUndefined();
+    expect(agentWs.send).not.toHaveBeenCalled();
   });
 });

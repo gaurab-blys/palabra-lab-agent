@@ -1,10 +1,40 @@
 const express = require('express');
 const path = require('path');
 const logger = require('../logger');
-const { startOutboundPair } = require('../voice/outboundCall');
+const { startOutboundPair, hangUp } = require('../voice/outboundCall');
 const { getVoiceToken } = require('../voiceToken');
-const { listPairs } = require('../stream/sessionStore');
+const {
+  getLegByCallSid,
+  getPeerByCallSid,
+  removePair,
+  listPairs,
+} = require('../stream/sessionStore');
 const { VOICE_WEBHOOK_PATH, VOICE_STATUS_PATH } = require('../config');
+
+const TERMINAL_CALL_STATUSES = new Set([
+  'completed',
+  'busy',
+  'no-answer',
+  'failed',
+  'canceled',
+]);
+
+/**
+ * When one call ends, hang up its peer and clear the pair.
+ * @param {string} callSid
+ */
+const hangUpPeerIfPaired = (callSid) => {
+  if (!callSid) return;
+  const self = getLegByCallSid(callSid);
+  const peer = getPeerByCallSid(callSid);
+  const peerCallSid = peer?.callSid;
+  const pairId = self?.pairId || peer?.pairId;
+
+  if (peer?.session) peer.session.end();
+  if (self?.session) self.session.end();
+  if (peerCallSid) hangUp(peerCallSid);
+  if (pairId) removePair(pairId);
+};
 
 const router = express.Router();
 
@@ -89,15 +119,24 @@ router.post(VOICE_WEBHOOK_PATH, express.urlencoded({ extended: false }), async (
 });
 
 /**
- * Twilio voice status callback — same path as blysnode POST /api/v2/webhook/twilio/voice/status.
+ * Twilio voice status callback — hang up the opposite leg on terminal status.
  */
 router.post(VOICE_STATUS_PATH, express.urlencoded({ extended: false }), (req, res) => {
+  const callSid = req.body.CallSid;
+  const callStatus = req.body.CallStatus;
+
   logger.info('[webhook] voice status', {
-    CallSid: req.body.CallSid,
-    CallStatus: req.body.CallStatus,
+    CallSid: callSid,
+    CallStatus: callStatus,
     StreamEvent: req.body.StreamEvent,
     StreamError: req.body.StreamError,
   });
+
+  if (callSid && TERMINAL_CALL_STATUSES.has(String(callStatus || ''))) {
+    logger.info('[webhook] terminal status — hanging up peer', { callSid, callStatus });
+    hangUpPeerIfPaired(callSid);
+  }
+
   res.sendStatus(204);
 });
 

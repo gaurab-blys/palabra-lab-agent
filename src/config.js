@@ -11,6 +11,27 @@ const PALABRA_AUDIO_FORMAT = {
   chunkMs: 320,
 };
 
+/**
+ * Palabra pipeline tuned for complete phrases over lowest latency.
+ * Previous lab values (2s desired / 8s max / 1.45× tempo / 0.5s silence)
+ * dropped or sped through TTS when the speaker outpaced playback.
+ *
+ * @see https://docs.palabra.ai/docs/streaming_api/translation_settings_breakdown
+ */
+const PALABRA_PIPELINE = {
+  segmentConfirmationSilenceThreshold: parseFloat(
+    process.env.PALABRA_SILENCE_THRESHOLD_S || '0.8'
+  ),
+  onlyConfirmBySilence: false,
+  translationQueue: {
+    desiredQueueLevelMs: parseInt(process.env.PALABRA_DESIRED_QUEUE_MS || '8000', 10),
+    maxQueueLevelMs: parseInt(process.env.PALABRA_MAX_QUEUE_MS || '24000', 10),
+    autoTempo: false,
+    minTempo: 1.0,
+    maxTempo: 1.0,
+  },
+};
+
 const LANGUAGE_PAIRS = {
   agent: {
     sourceLanguage: process.env.AGENT_SOURCE_LANG || 'en',
@@ -57,6 +78,7 @@ module.exports = {
   LANGUAGE_PAIRS,
   TWILIO_AUDIO_FORMAT,
   PALABRA_AUDIO_FORMAT,
+  PALABRA_PIPELINE,
   PALABRA_WS,
   TWILIO_WEBHOOK_BASE,
   VOICE_WEBHOOK_PATH,

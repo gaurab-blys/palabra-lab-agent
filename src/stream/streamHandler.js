@@ -26,8 +26,8 @@ const { hangUp } = require('../voice/outboundCall');
 const CHUNK_BYTES = Math.round((TWILIO_AUDIO_FORMAT.sampleRate * PALABRA_AUDIO_FORMAT.chunkMs) / 1000);
 const WS_OPEN = WebSocket.OPEN || 1;
 
-/** ~2s of 8 kHz μ-law — hold TTS while the other leg is still ringing. */
-const MAX_TTS_QUEUE_BYTES = 16000;
+/** ~8s of 8 kHz μ-law — hold TTS while the other leg is still ringing. */
+const MAX_TTS_QUEUE_BYTES = 64000;
 
 /**
  * Sends μ-law audio onto a Twilio media stream.

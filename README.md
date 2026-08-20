@@ -105,7 +105,10 @@ Edit `.env` or Palabra session config in `src/palabraSession.js`:
 | `AGENT_SOURCE_LANG` / `AGENT_TARGET_LANG` | `en` / `hi` | Agent leg translation direction |
 | `CLIENT_SOURCE_LANG` / `CLIENT_TARGET_LANG` | `hi` / `en` | Client leg translation direction |
 | `PALABRA_AUDIO_FORMAT.chunkMs` in config | `320` | μ-law buffer before sending to Palabra |
-| `segment_confirmation_silence_threshold` | `0.5` | Lower = faster TTS start, may cut phrases |
+| `PALABRA_SILENCE_THRESHOLD_S` | `0.8` | Silence before a phrase is confirmed. Lower = faster TTS, more cut-offs |
+| `PALABRA_DESIRED_QUEUE_MS` | `8000` | Target unspoken TTS buffer. Palabra recommended 5000–10000 |
+| `PALABRA_MAX_QUEUE_MS` | `24000` | Above this Palabra **drops** older TTS. Keep ~3× desired |
+| `auto_tempo` | `false` | When true, Palabra speeds speech (up to 1.45×) to catch up |
 | `translate_partial_transcriptions` | `false` | `true` = faster but choppier TTS |
 
 ## Interrupt Palabra WebSocket (TC-06)

@@ -46,7 +46,16 @@ describe('palabraSession', () => {
 
     expect(msg.message_type).toBe('set_task');
     expect(msg.data.pipeline.transcription.source_language).toBe('en');
+    expect(msg.data.pipeline.transcription.segment_confirmation_silence_threshold).toBe(0.8);
+    expect(msg.data.pipeline.transcription.only_confirm_by_silence).toBe(false);
     expect(msg.data.pipeline.translations[0].target_language).toBe('hi');
+    expect(msg.data.pipeline.translation_queue_configs.global).toMatchObject({
+      desired_queue_level_ms: 8000,
+      max_queue_level_ms: 24000,
+      auto_tempo: false,
+      min_tempo: 1.0,
+      max_tempo: 1.0,
+    });
     expect(msg.data.input_stream.source.sample_rate).toBe(24000);
     expect(msg.data.input_stream.source.format).toBe('pcm_s16le');
   });

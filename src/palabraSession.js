@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const logger = require('./logger');
-const { PALABRA_WS, PALABRA_AUDIO_FORMAT } = require('./config');
+const { PALABRA_WS, PALABRA_AUDIO_FORMAT, PALABRA_PIPELINE } = require('./config');
 
 const POLL_MS = 2100;
 const MAX_POLLS = 5;
@@ -45,7 +45,9 @@ const buildSetTaskMessage = ({ sourceLanguage, targetLanguage }) => ({
     pipeline: {
       transcription: {
         source_language: sourceLanguage,
-        segment_confirmation_silence_threshold: 0.5,
+        segment_confirmation_silence_threshold:
+          PALABRA_PIPELINE.segmentConfirmationSilenceThreshold,
+        only_confirm_by_silence: PALABRA_PIPELINE.onlyConfirmBySilence,
         sentence_splitter: { enabled: true },
       },
       translations: [
@@ -65,11 +67,11 @@ const buildSetTaskMessage = ({ sourceLanguage, targetLanguage }) => ({
       ],
       translation_queue_configs: {
         global: {
-          desired_queue_level_ms: 2000,
-          max_queue_level_ms: 8000,
-          auto_tempo: true,
-          min_tempo: 1.15,
-          max_tempo: 1.45,
+          desired_queue_level_ms: PALABRA_PIPELINE.translationQueue.desiredQueueLevelMs,
+          max_queue_level_ms: PALABRA_PIPELINE.translationQueue.maxQueueLevelMs,
+          auto_tempo: PALABRA_PIPELINE.translationQueue.autoTempo,
+          min_tempo: PALABRA_PIPELINE.translationQueue.minTempo,
+          max_tempo: PALABRA_PIPELINE.translationQueue.maxTempo,
         },
       },
     },

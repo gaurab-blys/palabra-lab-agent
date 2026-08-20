@@ -7,14 +7,7 @@ const mockCalls = Object.assign(
   }
 );
 
-const mockHangUp = jest.fn().mockResolvedValue(undefined);
-
-jest.mock('../src/voice/outboundCall', () => {
-  const actual = jest.requireActual('../src/voice/outboundCall');
-  return { ...actual, hangUp: (...args) => mockHangUp(...args) };
-});
-
-jest.mock('../src/twilioClient', () => ({
+jest.mock('../src/voice/twilioClient', () => ({
   twilioClient: { calls: mockCalls },
 }));
 
@@ -29,8 +22,8 @@ jest.mock('../src/palabraSession', () => ({
 }));
 
 const { createSession } = require('../src/palabraSession');
-const { handleConnection, INBOUND_CHUNK_BYTES } = require('../src/mediaStream');
-const { registry } = require('../src/pairRegistry');
+const { handleConnection, INBOUND_CHUNK_BYTES } = require('../src/stream/streamHandler');
+const { registry, upsertLeg } = require('../src/stream/sessionStore');
 
 describe('mediaStream', () => {
   const createFakeWs = () => {
@@ -46,7 +39,15 @@ describe('mediaStream', () => {
     };
   };
 
-  const startEvent = ({ callSid, streamSid, pairId, role, sourceLanguage, targetLanguage }) =>
+  const startEvent = ({
+    callSid,
+    streamSid,
+    pairId,
+    peerCallSid,
+    playback,
+    sourceLanguage,
+    targetLanguage,
+  }) =>
     JSON.stringify({
       event: 'start',
       start: {
@@ -54,16 +55,65 @@ describe('mediaStream', () => {
         streamSid,
         customParameters: {
           pairId,
-          role,
+          peerCallSid,
+          playback: playback || 'twilio',
           ...(sourceLanguage ? { sourceLanguage } : {}),
           ...(targetLanguage ? { targetLanguage } : {}),
         },
       },
     });
 
+  const pairBothLegs = () => {
+    const agentWs = createFakeWs();
+    const clientWs = createFakeWs();
+    const browserWs = createFakeWs();
+    registry.registerPair('PAIR1', {
+      agentCallSid: 'CA_AGENT',
+      clientCallSid: 'CA_CLIENT',
+      from: '+1',
+      to: '+2',
+    });
+    handleConnection(agentWs);
+    handleConnection(clientWs);
+
+    agentWs.emit(
+      'message',
+      startEvent({
+        callSid: 'CA_AGENT',
+        streamSid: 'MZ_AGENT',
+        pairId: 'PAIR1',
+        peerCallSid: 'CA_CLIENT',
+        playback: 'browser',
+        sourceLanguage: 'en',
+        targetLanguage: 'hi',
+      })
+    );
+    clientWs.emit(
+      'message',
+      startEvent({
+        callSid: 'CA_CLIENT',
+        streamSid: 'MZ_CLIENT',
+        pairId: 'PAIR1',
+        peerCallSid: 'CA_AGENT',
+        playback: 'twilio',
+        sourceLanguage: 'hi',
+        targetLanguage: 'en',
+      })
+    );
+
+    upsertLeg({
+      pairId: 'PAIR1',
+      callSid: 'CA_AGENT',
+      peerCallSid: 'CA_CLIENT',
+      playback: 'browser',
+      browserWs,
+    });
+
+    return { agentWs, clientWs, browserWs };
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
-    mockHangUp.mockClear();
     registry.removePair('PAIR1');
   });
 
@@ -71,21 +121,118 @@ describe('mediaStream', () => {
     registry.removePair('PAIR1');
   });
 
-  it('creates a Palabra session using the agent language pair on Twilio start', () => {
+  it('creates a Palabra session from TwiML language params on start', () => {
     const ws = createFakeWs();
     handleConnection(ws);
 
     ws.emit(
       'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ1', pairId: 'PAIR1', role: 'agent' })
+      startEvent({
+        callSid: 'CA_AGENT',
+        streamSid: 'MZ1',
+        pairId: 'PAIR1',
+        peerCallSid: 'CA_CLIENT',
+        playback: 'browser',
+        sourceLanguage: 'en',
+        targetLanguage: 'hi',
+      })
     );
 
     expect(createSession).toHaveBeenCalledTimes(1);
     expect(capturedSessionArgs).toMatchObject({ sourceLanguage: 'en', targetLanguage: 'hi' });
     expect(registry.get('CA_AGENT').session).toBe(mockSession);
+    expect(registry.get('CA_AGENT').playback).toBe('browser');
   });
 
-  it('uses explicit sourceLanguage/targetLanguage from customParameters', () => {
+  it('ignores a start message without pairId/peerCallSid', () => {
+    const ws = createFakeWs();
+    handleConnection(ws);
+    ws.emit(
+      'message',
+      JSON.stringify({ event: 'start', start: { callSid: 'CA_UNKNOWN', streamSid: 'MZ1' } })
+    );
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it('forwards inbound mic to Palabra only after both legs are live', () => {
+    const { agentWs } = pairBothLegs();
+    mockSession.sendAudio.mockClear();
+
+    const fullChunkPayload = Buffer.alloc(INBOUND_CHUNK_BYTES, 0xff).toString('base64');
+    agentWs.emit(
+      'message',
+      JSON.stringify({ event: 'media', media: { track: 'inbound', payload: fullChunkPayload } })
+    );
+    expect(mockSession.sendAudio).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends agent translation to client Twilio media, never onto agent Twilio WS', () => {
+    const { agentWs, clientWs, browserWs } = pairBothLegs();
+
+    const agentOutput = createSession.mock.calls[0][0].onOutputAudio;
+    agentOutput({
+      transcriptionId: 'utt-1',
+      base64Audio: Buffer.alloc(320, 0).toString('base64'),
+      lastChunk: false,
+    });
+
+    expect(clientWs.send).toHaveBeenCalled();
+    expect(agentWs.send).not.toHaveBeenCalled();
+    expect(browserWs.send).not.toHaveBeenCalled();
+    const media = clientWs.send.mock.calls
+      .map(([raw]) => JSON.parse(raw))
+      .filter((m) => m.event === 'media');
+    expect(media[0].streamSid).toBe('MZ_CLIENT');
+  });
+
+  it('sends client translation to browser playback WS, never onto agent Twilio WS', () => {
+    const { agentWs, clientWs, browserWs } = pairBothLegs();
+
+    const clientOutput = createSession.mock.calls[1][0].onOutputAudio;
+    clientOutput({
+      transcriptionId: 'utt-2',
+      base64Audio: Buffer.alloc(320, 0).toString('base64'),
+      lastChunk: false,
+    });
+
+    expect(browserWs.send).toHaveBeenCalled();
+    expect(agentWs.send).not.toHaveBeenCalled();
+    expect(clientWs.send).not.toHaveBeenCalled();
+    const msg = JSON.parse(browserWs.send.mock.calls[0][0]);
+    expect(msg).toMatchObject({ event: 'audio', format: 'mulaw', sampleRate: 8000 });
+    expect(msg.payload).toBeTruthy();
+  });
+
+  it('does not feed mic to Palabra until peer leg is live', () => {
+    const agentWs = createFakeWs();
+    const clientWs = createFakeWs();
+    registry.registerPair('PAIR1', { agentCallSid: 'CA_AGENT', clientCallSid: 'CA_CLIENT' });
+    handleConnection(agentWs);
+    handleConnection(clientWs);
+
+    agentWs.emit(
+      'message',
+      startEvent({
+        callSid: 'CA_AGENT',
+        streamSid: 'MZ_AGENT',
+        pairId: 'PAIR1',
+        peerCallSid: 'CA_CLIENT',
+        playback: 'browser',
+        sourceLanguage: 'en',
+        targetLanguage: 'hi',
+      })
+    );
+
+    const fullChunkPayload = Buffer.alloc(INBOUND_CHUNK_BYTES, 0xff).toString('base64');
+    agentWs.emit(
+      'message',
+      JSON.stringify({ event: 'media', media: { track: 'inbound', payload: fullChunkPayload } })
+    );
+    expect(mockSession.sendAudio).not.toHaveBeenCalled();
+    expect(agentWs.send).not.toHaveBeenCalled();
+  });
+
+  it('ends the Palabra session and clears the pair when the only leg disconnects', () => {
     const ws = createFakeWs();
     handleConnection(ws);
     ws.emit(
@@ -94,231 +241,14 @@ describe('mediaStream', () => {
         callSid: 'CA_AGENT',
         streamSid: 'MZ1',
         pairId: 'PAIR1',
-        role: 'agent',
-        sourceLanguage: 'fr',
-        targetLanguage: 'de',
+        peerCallSid: 'CA_CLIENT',
+        playback: 'browser',
+        sourceLanguage: 'en',
+        targetLanguage: 'hi',
       })
     );
 
-    expect(createSession).toHaveBeenCalledTimes(1);
-    expect(capturedSessionArgs).toMatchObject({ sourceLanguage: 'fr', targetLanguage: 'de' });
-  });
-
-  it('ignores a start message without pairId/role', () => {
-    const ws = createFakeWs();
-    handleConnection(ws);
-
-    ws.emit(
-      'message',
-      JSON.stringify({ event: 'start', start: { callSid: 'CA_UNKNOWN', streamSid: 'MZ1' } })
-    );
-
-    expect(createSession).not.toHaveBeenCalled();
-  });
-
-  it('forwards agent inbound (bidirectional stream mic) to Palabra', () => {
-    const ws = createFakeWs();
-    handleConnection(ws);
-    ws.emit(
-      'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ1', pairId: 'PAIR1', role: 'agent' })
-    );
-
-    const fullChunkPayload = Buffer.alloc(INBOUND_CHUNK_BYTES, 0xff).toString('base64');
-    ws.emit(
-      'message',
-      JSON.stringify({ event: 'media', media: { track: 'inbound', payload: fullChunkPayload } })
-    );
-    expect(mockSession.sendAudio).toHaveBeenCalledTimes(1);
-    expect(capturedSessionArgs).toMatchObject({ sourceLanguage: 'en', targetLanguage: 'hi' });
-  });
-
-  it('switches agent mic to outbound when Voice SDK starts sending it', () => {
-    const ws = createFakeWs();
-    handleConnection(ws);
-    ws.emit(
-      'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ1', pairId: 'PAIR1', role: 'agent' })
-    );
-
-    const inboundPayload = Buffer.alloc(INBOUND_CHUNK_BYTES, 0xaa).toString('base64');
-    ws.emit(
-      'message',
-      JSON.stringify({ event: 'media', media: { track: 'inbound', payload: inboundPayload } })
-    );
-    expect(mockSession.sendAudio).toHaveBeenCalledTimes(1);
-    mockSession.sendAudio.mockClear();
-
-    const outboundPayload = Buffer.alloc(INBOUND_CHUNK_BYTES, 0xff).toString('base64');
-    ws.emit(
-      'message',
-      JSON.stringify({ event: 'media', media: { track: 'outbound', payload: outboundPayload } })
-    );
-    expect(mockSession.sendAudio).toHaveBeenCalledTimes(1);
-
-    mockSession.sendAudio.mockClear();
-    ws.emit(
-      'message',
-      JSON.stringify({ event: 'media', media: { track: 'inbound', payload: inboundPayload } })
-    );
-    expect(mockSession.sendAudio).not.toHaveBeenCalled();
-  });
-
-  it('buffers client inbound media and forwards once a full chunk is accumulated', () => {
-    const ws = createFakeWs();
-    handleConnection(ws);
-    ws.emit(
-      'message',
-      startEvent({ callSid: 'CA_CLIENT', streamSid: 'MZ1', pairId: 'PAIR1', role: 'client' })
-    );
-
-    const smallPayload = Buffer.alloc(10, 0xff).toString('base64');
-    ws.emit(
-      'message',
-      JSON.stringify({ event: 'media', media: { track: 'inbound', payload: smallPayload } })
-    );
-    expect(mockSession.sendAudio).not.toHaveBeenCalled();
-
-    const fullChunkPayload = Buffer.alloc(INBOUND_CHUNK_BYTES, 0xff).toString('base64');
-    ws.emit(
-      'message',
-      JSON.stringify({ event: 'media', media: { track: 'inbound', payload: fullChunkPayload } })
-    );
-    expect(mockSession.sendAudio).toHaveBeenCalledTimes(1);
-    expect(capturedSessionArgs).toMatchObject({ sourceLanguage: 'hi', targetLanguage: 'en' });
-  });
-
-  it('forwards Twilio Client outbound-tagged mic audio on the agent leg', () => {
-    const ws = createFakeWs();
-    handleConnection(ws);
-    ws.emit(
-      'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ1', pairId: 'PAIR1', role: 'agent' })
-    );
-
-    const fullChunkPayload = Buffer.alloc(INBOUND_CHUNK_BYTES, 0xff).toString('base64');
-    ws.emit(
-      'message',
-      JSON.stringify({ event: 'media', media: { track: 'outbound', payload: fullChunkPayload } })
-    );
-    expect(mockSession.sendAudio).toHaveBeenCalledTimes(1);
-  });
-
-  it('sends Palabra TTS to the peer even when OPEN is not copied onto the socket instance', () => {
-    const agentWs = createFakeWs();
-    const clientWs = createFakeWs();
-    delete clientWs.OPEN;
-    registry.registerPair('PAIR1', { agentCallSid: 'CA_AGENT', clientCallSid: 'CA_CLIENT' });
-    handleConnection(agentWs);
-    handleConnection(clientWs);
-
-    agentWs.emit(
-      'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ_AGENT', pairId: 'PAIR1', role: 'agent' })
-    );
-    clientWs.emit(
-      'message',
-      startEvent({ callSid: 'CA_CLIENT', streamSid: 'MZ_CLIENT', pairId: 'PAIR1', role: 'client' })
-    );
-
-    const agentOutput = createSession.mock.calls[0][0].onOutputAudio;
-    const base64Audio = Buffer.alloc(320, 0).toString('base64');
-    agentOutput({ transcriptionId: 'utt-1', base64Audio, lastChunk: false });
-
-    expect(clientWs.send).toHaveBeenCalled();
-    expect(agentWs.send).not.toHaveBeenCalled();
-  });
-
-  it('buffers TTS until the peer leg connects, then flushes on pairing', () => {
-    const agentWs = createFakeWs();
-    const clientWs = createFakeWs();
-    registry.registerPair('PAIR1', { agentCallSid: 'CA_AGENT', clientCallSid: 'CA_CLIENT' });
-    handleConnection(agentWs);
-    handleConnection(clientWs);
-
-    agentWs.emit(
-      'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ_AGENT', pairId: 'PAIR1', role: 'agent' })
-    );
-
-    const agentOutput = createSession.mock.calls[0][0].onOutputAudio;
-    const base64Audio = Buffer.alloc(320, 0).toString('base64');
-    agentOutput({ transcriptionId: 'utt-early', base64Audio, lastChunk: false });
-
-    expect(clientWs.send).not.toHaveBeenCalled();
-
-    clientWs.emit(
-      'message',
-      startEvent({ callSid: 'CA_CLIENT', streamSid: 'MZ_CLIENT', pairId: 'PAIR1', role: 'client' })
-    );
-
-    expect(clientWs.send).toHaveBeenCalled();
-    expect(agentWs.send).not.toHaveBeenCalled();
-  });
-
-  it('does not feed agent outbound TTS echo back into Palabra while playback is suppressed', () => {
-    const agentWs = createFakeWs();
-    const clientWs = createFakeWs();
-    registry.registerPair('PAIR1', { agentCallSid: 'CA_AGENT', clientCallSid: 'CA_CLIENT' });
-    handleConnection(agentWs);
-    handleConnection(clientWs);
-
-    agentWs.emit(
-      'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ_AGENT', pairId: 'PAIR1', role: 'agent' })
-    );
-    clientWs.emit(
-      'message',
-      startEvent({ callSid: 'CA_CLIENT', streamSid: 'MZ_CLIENT', pairId: 'PAIR1', role: 'client' })
-    );
-
-    const clientOutput = createSession.mock.calls[1][0].onOutputAudio;
-    const base64Audio = Buffer.alloc(320, 0).toString('base64');
-    clientOutput({ transcriptionId: 'utt-2', base64Audio, lastChunk: false });
-
-    mockSession.sendAudio.mockClear();
-    const echoPayload = Buffer.alloc(INBOUND_CHUNK_BYTES, 0xaa).toString('base64');
-    agentWs.emit(
-      'message',
-      JSON.stringify({ event: 'media', media: { track: 'outbound', payload: echoPayload } })
-    );
-
-    expect(mockSession.sendAudio).not.toHaveBeenCalled();
-  });
-
-  it('hangs up the agent leg when the client disconnects', () => {
-    const agentWs = createFakeWs();
-    const clientWs = createFakeWs();
-    registry.registerPair('PAIR1', { agentCallSid: 'CA_AGENT', clientCallSid: 'CA_CLIENT' });
-    handleConnection(agentWs);
-    handleConnection(clientWs);
-
-    agentWs.emit(
-      'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ_AGENT', pairId: 'PAIR1', role: 'agent' })
-    );
-    clientWs.emit(
-      'message',
-      startEvent({ callSid: 'CA_CLIENT', streamSid: 'MZ_CLIENT', pairId: 'PAIR1', role: 'client' })
-    );
-
-    mockHangUp.mockClear();
-    clientWs.emit('close');
-
-    expect(mockHangUp).toHaveBeenCalledWith('CA_AGENT');
-    expect(registry.getPair('PAIR1')).toBeUndefined();
-  });
-
-  it('ends the Palabra session and clears the pair when the only leg disconnects', () => {
-    const ws = createFakeWs();
-    handleConnection(ws);
-    ws.emit(
-      'message',
-      startEvent({ callSid: 'CA_AGENT', streamSid: 'MZ1', pairId: 'PAIR1', role: 'agent' })
-    );
-
     ws.emit('close');
-
     expect(mockSession.end).toHaveBeenCalled();
     expect(registry.getPair('PAIR1')).toBeUndefined();
   });

@@ -53,6 +53,8 @@ const TWILIO_WEBHOOK_BASE = '/api/v2/webhook/twilio';
 const VOICE_WEBHOOK_PATH = `${TWILIO_WEBHOOK_BASE}/voice`;
 const VOICE_STATUS_PATH = `${TWILIO_WEBHOOK_BASE}/voice/status`;
 const MEDIA_STREAM_PATH = `${TWILIO_WEBHOOK_BASE}/voice/palabra-stream`;
+/** Browser agent hears client translations here — not on the Twilio Voice SDK call. */
+const AGENT_PLAYBACK_PATH = '/agent-playback';
 
 const getMediaStreamUrl = () => {
   const base = (process.env.WEBHOOK_BASE_URL || 'http://localhost:4000').replace(/\/$/, '');
@@ -84,6 +86,7 @@ module.exports = {
   VOICE_WEBHOOK_PATH,
   VOICE_STATUS_PATH,
   MEDIA_STREAM_PATH,
+  AGENT_PLAYBACK_PATH,
   getMediaStreamUrl,
   getVoiceWebhookUrl,
   getVoiceStatusUrl,

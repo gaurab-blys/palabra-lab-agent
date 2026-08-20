@@ -66,7 +66,10 @@
   </head>
   <body>
     <h1>Palabra Lab Agent</h1>
-    <p>Speak here in the browser — the client phone will ring.</p>
+    <p>
+      Speak in the browser (mic via Twilio). Client translations play
+      <strong>here in the page</strong> — not on the Twilio call leg.
+    </p>
 
     <label for="caller">Caller number (Twilio)</label>
     <input id="caller" type="tel" placeholder="+19189194048" />
@@ -87,8 +90,8 @@
     <div id="status">Loading…</div>
 
     <p class="hint">
-      TwiML App voice URL must be
-      <code>WEBHOOK_BASE_URL/api/v2/webhook/twilio/voice</code>
+      Architecture: agent Twilio stream = mic only. Peer TTS →
+      <code>/agent-playback</code> → Web Audio. Client PSTN still gets Twilio media inject.
     </p>
 
     <script>
@@ -108,6 +111,111 @@
 
       let device;
       let activeCall;
+      let playbackWs;
+      let bindTimer;
+      let audioCtx;
+      let nextPlayTime = 0;
+
+      /** μ-law byte → linear PCM float in [-1, 1] */
+      const mulawToFloat = (mu) => {
+        const MULAW_MAX = 0x1fff;
+        const u = ~mu & 0xff;
+        const sign = u & 0x80;
+        const exponent = (u >> 4) & 0x07;
+        const mantissa = u & 0x0f;
+        let sample = ((mantissa << 3) + 0x84) << exponent;
+        sample -= 0x84;
+        if (sign) sample = -sample;
+        return sample / (MULAW_MAX + 1);
+      };
+
+      const ensureAudio = async () => {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 8000,
+          });
+        }
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        return audioCtx;
+      };
+
+      const playMulawBase64 = async (b64) => {
+        const ctx = await ensureAudio();
+        const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const frames = raw.length;
+        const buffer = ctx.createBuffer(1, frames, 8000);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < frames; i += 1) data[i] = mulawToFloat(raw[i]);
+
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        const startAt = Math.max(ctx.currentTime + 0.01, nextPlayTime);
+        src.start(startAt);
+        nextPlayTime = startAt + buffer.duration;
+      };
+
+      const stopPlaybackSocket = () => {
+        if (bindTimer) {
+          clearInterval(bindTimer);
+          bindTimer = null;
+        }
+        if (playbackWs) {
+          try {
+            playbackWs.close();
+          } catch (_e) {}
+          playbackWs = null;
+        }
+        nextPlayTime = 0;
+      };
+
+      const sendBind = () => {
+        if (!playbackWs || playbackWs.readyState !== WebSocket.OPEN) return;
+        playbackWs.send(
+          JSON.stringify({
+            event: 'bind',
+            from: callerInput.value.trim(),
+            to: clientInput.value.trim(),
+          })
+        );
+      };
+
+      const startPlaybackSocket = () => {
+        stopPlaybackSocket();
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        playbackWs = new WebSocket(proto + '//' + location.host + '/agent-playback');
+
+        playbackWs.onopen = () => {
+          sendBind();
+          bindTimer = setInterval(sendBind, 500);
+        };
+
+        playbackWs.onmessage = (ev) => {
+          let msg;
+          try {
+            msg = JSON.parse(ev.data);
+          } catch (_e) {
+            return;
+          }
+          if (msg.event === 'bound') {
+            if (bindTimer) {
+              clearInterval(bindTimer);
+              bindTimer = null;
+            }
+            setStatus('Playback bound — speak after client answers.');
+            return;
+          }
+          if (msg.event === 'audio' && msg.payload) {
+            playMulawBase64(msg.payload).catch((err) =>
+              console.warn('playback failed', err)
+            );
+          }
+        };
+
+        playbackWs.onclose = () => {
+          playbackWs = null;
+        };
+      };
 
       const setStatus = (msg) => {
         statusEl.textContent = msg;
@@ -159,21 +267,26 @@
         }
         setStatus('Connecting…');
         try {
+          await ensureAudio();
+          startPlaybackSocket();
           activeCall = await device.connect({ params: { To, From } });
           setInCall(true);
-          setStatus('Connected — client phone should ring.');
+          setStatus('Connected — client ringing. Translations play in this page.');
           activeCall.on('disconnect', () => {
             activeCall = null;
             setInCall(false);
+            stopPlaybackSocket();
             setStatus('Call ended.');
           });
         } catch (err) {
+          stopPlaybackSocket();
           setStatus('Connect failed: ' + err.message);
         }
       });
 
       hangupBtn.addEventListener('click', () => {
         if (activeCall) activeCall.disconnect();
+        stopPlaybackSocket();
       });
 
       muteBtn.addEventListener('click', () => {
@@ -193,7 +306,7 @@
         if (!activeCall) return;
         interruptBtn.disabled = true;
         try {
-          const res = await fetch('/debug/drop-palabra?role=agent', { method: 'POST' });
+          const res = await fetch('/debug/drop-palabra', { method: 'POST' });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) {
             setStatus('Interrupt failed: ' + (data.error || res.status));

@@ -11,11 +11,10 @@ place-call.js  →  Twilio (agent leg)  →  POST /api/v2/webhook/twilio/voice
                                               ↓
                                     dials client leg + returns agent TwiML
                                               ↓
-                         both legs → WS /api/v2/webhook/twilio/voice/palabra-stream
+                         both legs → WS .../palabra-stream  (mic → Palabra)
                                               ↓
-                         agent (en→hi) + client (hi→en) Palabra sessions
-                                              ↓
-                         translated TTS relayed to peer via Twilio media
+              agent TTS (en→hi)  →  client Twilio media inject
+              client TTS (hi→en) →  browser /agent-playback (NOT agent Twilio leg)
 ```
 
 ## Quick start
@@ -123,8 +122,8 @@ This is **not** in blysnode today (`palabraWs.js` close handler only stops polli
 2. On the agent page, use **Interrupt Palabra** (drops the agent Palabra socket; call stays up). Or from a terminal:
 
 ```bash
-# Drop both legs (or ?role=agent / ?role=client)
-curl -X POST "http://localhost:4000/debug/drop-palabra?role=both"
+# Drop both legs (or ?callSid=CAxxx for one)
+curl -X POST "http://localhost:4000/debug/drop-palabra"
 ```
 
 **Mute mic** on `/agent` mutes the browser microphone via the Twilio Voice SDK — Palabra should stop receiving English until you unmute.
@@ -176,7 +175,9 @@ Unit tests mock Twilio and Palabra — no live API calls.
 - 35s timeout hangs up both legs if client stream doesn't start
 - Check client phone number format (`+1...`)
 
-**Echo or double audio**
+**Echo or double audio / agent hears their own translation**
 
-- Agent outbound track suppression is enabled — see `mediaStream.js`
-- If using Twilio Client SDK as agent, outbound-tagged mic is supported
+- Root cause was architectural: injecting peer TTS onto the **same** Voice SDK Connect/Stream that captures the agent mic
+- Fix: agent Twilio stream is **mic-only**; client→agent TTS plays in the browser via `/agent-playback`
+- Client PSTN still receives agent→client TTS via Twilio media inject
+- Confirm logs: `via: "agent-playback-ws"` for client→agent, `via: "twilio-media"` for agent→client

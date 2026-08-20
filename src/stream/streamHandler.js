@@ -15,28 +15,112 @@ const {
 const { createSession } = require('../palabraSession');
 const {
   upsertLeg,
-  getLeg,
-  getOppositeLegByCallSid,
+  getLegByCallSid,
+  getPeerByCallSid,
   detachLegByCallSid,
   getPairMeta,
   removePair,
 } = require('./sessionStore');
+const { deliverToBrowserPlayback } = require('./agentPlayback');
 const { hangUp } = require('../voice/outboundCall');
 
 const CHUNK_BYTES = Math.round((TWILIO_AUDIO_FORMAT.sampleRate * PALABRA_AUDIO_FORMAT.chunkMs) / 1000);
 const WS_OPEN = WebSocket.OPEN || 1;
 
-/** ~8s of 8 kHz μ-law — hold TTS while the other leg is still ringing. */
-const MAX_TTS_QUEUE_BYTES = 64000;
+/**
+ * @param {string} pairId
+ * @param {string} callSid
+ * @param {string} peerCallSid
+ */
+const areBothLegsLive = (pairId, callSid, peerCallSid) => {
+  const meta = getPairMeta(pairId);
+  if (meta.bothLegsReady) return true;
+
+  const self = getLegByCallSid(callSid);
+  const peer = getLegByCallSid(peerCallSid);
+  if (!self?.ws || !self.streamSid || !peer?.ws || !peer.streamSid) return false;
+  if (self.ws === peer.ws || self.callSid === peer.callSid) return false;
+  if (self.ws.readyState !== WS_OPEN || peer.ws.readyState !== WS_OPEN) return false;
+
+  meta.bothLegsReady = true;
+  logger.info('[stream] legs paired — translation unlocked', {
+    pairId,
+    callSidA: self.callSid,
+    callSidB: peer.callSid,
+    playbackA: self.playback,
+    playbackB: peer.playback,
+  });
+  return true;
+};
 
 /**
- * Sends μ-law audio onto a Twilio media stream.
- * @param {object} peer
- * @param {Buffer|Uint8Array} muLawBytes
+ * Clears Twilio playback buffer on a PSTN leg.
+ * @param {object} leg
+ */
+const clearTwilioPlayback = (leg) => {
+  if (!leg?.ws || !leg.streamSid || leg.ws.readyState !== WS_OPEN) return;
+  if (leg.playback === 'browser') return; // never touch agent Twilio return path
+  try {
+    leg.ws.send(JSON.stringify({ event: 'clear', streamSid: leg.streamSid }));
+  } catch (err) {
+    logger.warn('[stream] clear failed', { callSid: leg.callSid, error: err.message });
+  }
+};
+
+/**
+ * Deliver translated μ-law to the peer using the peer's playback mode.
+ *
+ * Architecture:
+ * - Agent (browser): TTS goes to /agent-playback WebSocket → Web Audio in the page.
+ *   NEVER injected onto the agent Twilio Connect/Stream (that was the mix bug).
+ * - Client (twilio): TTS injected onto the client Connect/Stream WebSocket.
+ *
+ * @param {object} params
+ * @param {string} params.fromCallSid
+ * @param {string} params.toCallSid
+ * @param {import('ws').WebSocket} params.originWs
+ * @param {Buffer|Uint8Array} params.muLawBytes
+ * @param {boolean} [params.clearFirst]
  * @returns {boolean}
  */
-const deliverTtsToLeg = (peer, muLawBytes) => {
-  if (!peer?.ws || !peer.streamSid || peer.ws.readyState !== WS_OPEN) return false;
+const deliverTranslatedToPeer = ({
+  fromCallSid,
+  toCallSid,
+  originWs,
+  muLawBytes,
+  clearFirst,
+}) => {
+  if (!fromCallSid || !toCallSid || fromCallSid === toCallSid) {
+    logger.warn('[stream] refused TTS — bad CallSids', { fromCallSid, toCallSid });
+    return false;
+  }
+
+  const peer = getLegByCallSid(toCallSid);
+  if (!peer) return false;
+
+  if (peer.playback === 'browser') {
+    const ok = deliverToBrowserPlayback(peer, muLawBytes);
+    if (!ok && !peer.loggedBrowserDrop) {
+      peer.loggedBrowserDrop = true;
+      logger.info('[stream] browser playback not bound yet — drop TTS', {
+        toCallSid,
+        hint: 'open /agent and keep the page open during the call',
+      });
+    }
+    return ok;
+  }
+
+  // PSTN / Twilio playback leg
+  if (!peer.ws || !peer.streamSid || peer.ws.readyState !== WS_OPEN) return false;
+  if (peer.ws === originWs) {
+    logger.error('[stream] refused TTS — would write onto origin Twilio WS', {
+      fromCallSid,
+      toCallSid,
+    });
+    return false;
+  }
+
+  if (clearFirst) clearTwilioPlayback(peer);
 
   peer.ws.send(
     JSON.stringify({
@@ -45,99 +129,19 @@ const deliverTtsToLeg = (peer, muLawBytes) => {
       media: { payload: Buffer.from(muLawBytes).toString('base64') },
     })
   );
+
+  const playbackMs = Math.ceil((muLawBytes.length / TWILIO_AUDIO_FORMAT.sampleRate) * 1000);
+  upsertLeg({
+    pairId: peer.pairId,
+    callSid: peer.callSid,
+    peerCallSid: peer.peerCallSid,
+    suppressInboundUntil: Date.now() + playbackMs + 120,
+  });
+
   return true;
 };
 
 /**
- * Queues TTS for a peer that is not connected yet.
- * @param {string} pairId
- * @param {'agent'|'client'} peerRole
- * @param {Buffer|Uint8Array} muLawBytes
- */
-const queueTtsForPeer = (pairId, peerRole, muLawBytes) => {
-  const meta = getPairMeta(pairId);
-  const chunk = Buffer.from(muLawBytes);
-  const q = meta.ttsQueueFor[peerRole];
-  let size = q.reduce((n, b) => n + b.length, 0);
-  while (q.length && size + chunk.length > MAX_TTS_QUEUE_BYTES) {
-    size -= q.shift().length;
-  }
-  if (size + chunk.length <= MAX_TTS_QUEUE_BYTES) {
-    q.push(chunk);
-  }
-};
-
-/**
- * Plays queued TTS once the peer stream is up.
- * @param {string} pairId
- * @param {'agent'|'client'} peerRole
- */
-const flushTtsQueueForPeer = (pairId, peerRole) => {
-  const meta = getPairMeta(pairId);
-  const peer = getLeg(pairId, peerRole);
-  const q = meta.ttsQueueFor[peerRole];
-  if (!peer?.ws || !peer.streamSid || !q.length) return;
-
-  let chunks = 0;
-  let bytes = 0;
-  while (q.length) {
-    const chunk = q.shift();
-    if (deliverTtsToLeg(peer, chunk)) {
-      chunks += 1;
-      bytes += chunk.length;
-    } else {
-      q.unshift(chunk);
-      break;
-    }
-  }
-
-  if (peerRole === 'agent' && bytes) {
-    const playbackMs = Math.ceil((bytes / TWILIO_AUDIO_FORMAT.sampleRate) * 1000);
-    upsertLeg({
-      ...peer,
-      suppressOutboundUntil: Date.now() + playbackMs + 80,
-    });
-  }
-
-  if (chunks) {
-    logger.info('[stream] flushed buffered TTS', {
-      pairId,
-      peerRole,
-      toCallSid: peer.callSid,
-      toStreamSid: peer.streamSid,
-      chunks,
-    });
-  }
-};
-
-/**
- * Marks both legs connected and flushes any TTS that arrived during ring.
- * @param {string} pairId
- */
-const markLegsPaired = (pairId) => {
-  const agent = getLeg(pairId, 'agent');
-  const client = getLeg(pairId, 'client');
-  const meta = getPairMeta(pairId);
-
-  if (!agent?.ws || !client?.ws) return;
-  if (!agent.streamSid || !client.streamSid) return;
-  if (meta.bothLegsReady) return;
-
-  meta.bothLegsReady = true;
-  logger.info('[stream] legs paired', {
-    pairId,
-    agentCallSid: agent.callSid,
-    clientCallSid: client.callSid,
-    agentStreamSid: agent.streamSid,
-    clientStreamSid: client.streamSid,
-  });
-
-  flushTtsQueueForPeer(pairId, 'agent');
-  flushTtsQueueForPeer(pairId, 'client');
-};
-
-/**
- * Handles a Twilio Media Stream WebSocket connection.
  * @param {import('ws').WebSocket} ws
  */
 const handleConnection = (ws) => {
@@ -147,14 +151,16 @@ const handleConnection = (ws) => {
     callSid: undefined,
     streamSid: undefined,
     pairId: undefined,
-    role: undefined,
+    peerCallSid: undefined,
+    playback: 'twilio',
     sourceLanguage: undefined,
     targetLanguage: undefined,
     session: undefined,
   };
 
-  const flush = () => {
+  const flushMicToPalabra = () => {
     if (!state.session) return;
+    if (!areBothLegsLive(state.pairId, state.callSid, state.peerCallSid)) return;
 
     while (state.buffer.length >= CHUNK_BYTES) {
       const muLaw = Buffer.from(state.buffer.splice(0, CHUNK_BYTES));
@@ -169,64 +175,28 @@ const handleConnection = (ws) => {
     }
   };
 
-  const sendToPeer = (muLawBytes) => {
-    const opposite = getOppositeLegByCallSid(state.callSid);
-    if (!opposite) return;
+  const sendTranslatedAudioToPeer = (muLawBytes, { clearFirst = false } = {}) => {
+    if (!state.callSid || !state.peerCallSid) return;
+    if (!areBothLegsLive(state.pairId, state.callSid, state.peerCallSid)) return;
 
-    const peerReady =
-      opposite.ws &&
-      opposite.streamSid &&
-      opposite.ws !== ws &&
-      opposite.callSid !== state.callSid &&
-      opposite.ws.readyState === WS_OPEN;
+    const ok = deliverTranslatedToPeer({
+      fromCallSid: state.callSid,
+      toCallSid: state.peerCallSid,
+      originWs: ws,
+      muLawBytes,
+      clearFirst,
+    });
 
-    if (!peerReady) {
-      queueTtsForPeer(state.pairId, opposite.role, muLawBytes);
-      if (!state.loggedPeerDrop) {
-        state.loggedPeerDrop = true;
-        logger.info('[stream] peer not ready, buffering TTS', {
-          pairId: state.pairId,
-          fromRole: state.role,
-          toRole: opposite.role,
-          fromCallSid: state.callSid,
-          hasPeerWs: !!opposite.ws,
-          peerCallSid: opposite.callSid,
-        });
-      }
-      return;
-    }
-
-    if (opposite.role === 'agent') {
-      const playbackMs = Math.ceil((muLawBytes.length / TWILIO_AUDIO_FORMAT.sampleRate) * 1000);
-      upsertLeg({
-        ...opposite,
-        suppressOutboundUntil: Date.now() + playbackMs + 80,
-      });
-    }
-
-    try {
-      if (!deliverTtsToLeg(opposite, muLawBytes)) {
-        queueTtsForPeer(state.pairId, opposite.role, muLawBytes);
-        return;
-      }
-      if (!state.loggedTtsSent) {
-        state.loggedTtsSent = true;
-        logger.info('[stream] TTS sent to peer', {
-          pairId: state.pairId,
-          fromRole: state.role,
-          toRole: opposite.role,
-          fromCallSid: state.callSid,
-          toCallSid: opposite.callSid,
-          toStreamSid: opposite.streamSid,
-          bytes: muLawBytes.length,
-        });
-      }
-    } catch (err) {
-      logger.warn('[stream] relay failed', {
-        error: err.message,
+    if (ok && !state.loggedTtsSent) {
+      state.loggedTtsSent = true;
+      const peer = getLegByCallSid(state.peerCallSid);
+      logger.info('[stream] TTS to peer', {
         pairId: state.pairId,
-        fromRole: state.role,
-        toRole: opposite.role,
+        fromCallSid: state.callSid,
+        toCallSid: state.peerCallSid,
+        peerPlayback: peer?.playback,
+        toStreamSid: peer?.playback === 'twilio' ? peer?.streamSid : undefined,
+        via: peer?.playback === 'browser' ? 'agent-playback-ws' : 'twilio-media',
       });
     }
   };
@@ -245,7 +215,7 @@ const handleConnection = (ws) => {
       PALABRA_AUDIO_FORMAT.outputSampleRate,
       TWILIO_AUDIO_FORMAT.sampleRate
     );
-    sendToPeer(pcm16ToMuLawBuffer(pcm8k));
+    sendTranslatedAudioToPeer(pcm16ToMuLawBuffer(pcm8k), { clearFirst: !!isFirst });
 
     if (isFirst && Number.isFinite(state.lastT0)) {
       logger.info('[latency] palabra', {
@@ -263,46 +233,57 @@ const handleConnection = (ws) => {
     state.streamSid = payload.streamSid;
 
     const custom = payload.customParameters || {};
-
-    // TwiML customParameters are authoritative (same as ConversationRelay).
     state.pairId = custom.pairId;
-    state.role = custom.role;
+    state.peerCallSid = custom.peerCallSid;
+    state.playback = custom.playback === 'browser' ? 'browser' : 'twilio';
     state.sourceLanguage = custom.sourceLanguage;
     state.targetLanguage = custom.targetLanguage;
 
-    if (!state.pairId || (state.role !== 'agent' && state.role !== 'client')) {
-      logger.warn('[stream] missing pairId/role on start', {
+    if (!state.pairId || !state.peerCallSid) {
+      logger.warn('[stream] missing pairId/peerCallSid on start', {
         callSid: state.callSid,
         customParameters: custom,
       });
       return;
     }
 
-    const langs =
-      state.sourceLanguage && state.targetLanguage
-        ? { sourceLanguage: state.sourceLanguage, targetLanguage: state.targetLanguage }
-        : state.role === 'agent'
-          ? LANGUAGE_PAIRS.agent
-          : LANGUAGE_PAIRS.client;
+    if (state.peerCallSid === state.callSid) {
+      logger.warn('[stream] peerCallSid equals callSid — refusing', { callSid: state.callSid });
+      return;
+    }
 
-    state.sourceLanguage = langs.sourceLanguage;
-    state.targetLanguage = langs.targetLanguage;
+    if (!state.sourceLanguage || !state.targetLanguage) {
+      const preset = LANGUAGE_PAIRS.agent;
+      state.sourceLanguage = state.sourceLanguage || preset.sourceLanguage;
+      state.targetLanguage = state.targetLanguage || preset.targetLanguage;
+    }
 
     upsertLeg({
       pairId: state.pairId,
-      role: state.role,
       callSid: state.callSid,
+      peerCallSid: state.peerCallSid,
       streamSid: state.streamSid,
       sourceLanguage: state.sourceLanguage,
       targetLanguage: state.targetLanguage,
+      playback: state.playback,
       ws,
     });
 
+    const peer = getLegByCallSid(state.peerCallSid);
+    if (peer && peer.peerCallSid !== state.callSid) {
+      upsertLeg({
+        pairId: state.pairId,
+        callSid: state.peerCallSid,
+        peerCallSid: state.callSid,
+      });
+    }
+
     logger.info('[stream] leg registered', {
       pairId: state.pairId,
-      role: state.role,
       callSid: state.callSid,
+      peerCallSid: state.peerCallSid,
       streamSid: state.streamSid,
+      playback: state.playback,
       sourceLanguage: state.sourceLanguage,
       targetLanguage: state.targetLanguage,
     });
@@ -322,30 +303,48 @@ const handleConnection = (ws) => {
 
     upsertLeg({
       pairId: state.pairId,
-      role: state.role,
       callSid: state.callSid,
+      peerCallSid: state.peerCallSid,
       streamSid: state.streamSid,
       sourceLanguage: state.sourceLanguage,
       targetLanguage: state.targetLanguage,
+      playback: state.playback,
       ws,
       session: state.session,
     });
 
-    markLegsPaired(state.pairId);
+    areBothLegsLive(state.pairId, state.callSid, state.peerCallSid);
   };
 
   const cleanup = () => {
-    if (state.session) state.session.end();
+    if (state.cleanedUp) return;
+    state.cleanedUp = true;
 
+    if (state.session) {
+      state.session.end();
+      state.session = undefined;
+    }
     if (!state.callSid) return;
 
-    const opposite = getOppositeLegByCallSid(state.callSid);
+    const peer = getPeerByCallSid(state.callSid);
+    const peerCallSid = peer?.callSid;
+    const pairId = state.pairId || peer?.pairId;
+
     detachLegByCallSid(state.callSid);
 
-    // Either party hanging up ends the whole translation pair.
-    if (opposite?.session) opposite.session.end();
-    hangUp(opposite?.callSid);
-    if (state.pairId) removePair(state.pairId);
+    if (peer?.session) peer.session.end();
+
+    // One party left → always tear down the other call (client hangup ends agent, and vice versa).
+    if (peerCallSid) {
+      logger.info('[stream] peer hangup after leg left', {
+        leftCallSid: state.callSid,
+        hangUpCallSid: peerCallSid,
+        pairId,
+      });
+      hangUp(peerCallSid);
+    }
+
+    if (pairId) removePair(pairId);
   };
 
   ws.on('message', (raw) => {
@@ -367,39 +366,38 @@ const handleConnection = (ws) => {
     if (msg.event !== 'media' || !msg.media || !msg.media.payload) return;
 
     const track = msg.media.track || 'inbound';
+    if (track !== 'inbound') return;
 
-    if (state.role === 'client' && track === 'outbound') return;
-
-    if (state.role === 'agent') {
-      const agentLeg = getLeg(state.pairId, 'agent');
-
-      if (track === 'outbound') {
-        if (agentLeg?.suppressOutboundUntil && Date.now() < agentLeg.suppressOutboundUntil) {
-          return;
-        }
-        if (state.agentMicTrack !== 'outbound') {
-          state.agentMicTrack = 'outbound';
-          logger.info('[stream] agent mic track = outbound (Voice SDK)', {
-            callSid: state.callSid,
-          });
-        }
-      } else if (track === 'inbound') {
-        if (state.agentMicTrack === 'outbound') return;
-        state.agentMicTrack = 'inbound';
+    // Agent browser leg: never expect Twilio-return TTS; still guard PSTN echo.
+    if (state.playback !== 'browser') {
+      const self = getLegByCallSid(state.callSid);
+      if (self?.suppressInboundUntil) {
+        if (Date.now() < self.suppressInboundUntil) return;
+        clearTwilioPlayback(self);
+        upsertLeg({
+          pairId: self.pairId,
+          callSid: self.callSid,
+          peerCallSid: self.peerCallSid,
+          suppressInboundUntil: 0,
+        });
       }
     }
 
     if (!state.loggedMedia) {
       state.loggedMedia = true;
       logger.info('[stream] first media frame', {
-        role: state.role,
         track,
         callSid: state.callSid,
+        playback: state.playback,
       });
     }
 
+    if (!areBothLegsLive(state.pairId, state.callSid, state.peerCallSid)) {
+      return;
+    }
+
     state.buffer.push(...Buffer.from(msg.media.payload, 'base64'));
-    flush();
+    flushMicToPalabra();
   });
 
   ws.on('close', cleanup);

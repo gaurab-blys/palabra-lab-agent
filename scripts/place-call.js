@@ -10,7 +10,7 @@
 require('dotenv').config();
 
 const Twilio = require('twilio');
-const { twilioClient } = require('../src/twilioClient');
+const { twilioClient } = require('../src/voice/twilioClient');
 const {
   TWILIO_FROM_NUMBER,
   WEBHOOK_BASE_URL,

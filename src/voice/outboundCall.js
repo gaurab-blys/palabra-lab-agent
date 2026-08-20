@@ -3,10 +3,11 @@ const logger = require('../logger');
 const { twilioClient } = require('./twilioClient');
 const { buildLegTwiML } = require('./twiml');
 const {
-  registerPairCallSids,
-  getLeg,
+  registerPair,
+  getLegByCallSid,
   removePair,
 } = require('../stream/sessionStore');
+const { LANGUAGE_PAIRS } = require('../config');
 
 const DIAL_TIMEOUT_MS = 35000;
 
@@ -25,11 +26,10 @@ const hangUp = async (callSid) => {
 };
 
 /**
- * Starts an outbound agent+client pair on Connect/Stream (no conference).
- * Dials the client leg, registers the pair, and returns agent TwiML.
+ * Starts agent (browser playback) + client (Twilio TTS) pair.
  *
  * @param {{ from: string, to: string, agentCallSid: string }} params
- * @returns {Promise<string|null>} Agent leg TwiML, or null on dial failure
+ * @returns {Promise<string|null>}
  */
 const startOutboundPair = async ({ from, to, agentCallSid }) => {
   if (!from || !to || !agentCallSid) return null;
@@ -45,36 +45,65 @@ const startOutboundPair = async ({ from, to, agentCallSid }) => {
     peerCall = await twilioClient.calls.create({
       from,
       to,
-      twiml: buildLegTwiML({ pairId, role: 'client' }),
+      twiml: buildLegTwiML({
+        pairId,
+        peerCallSid: agentCallSid,
+        ...LANGUAGE_PAIRS.client,
+        langPreset: 'client',
+        playback: 'twilio',
+      }),
     });
   } catch (err) {
     logger.error('[outbound] client dial failed', { error: err.message });
     return null;
   }
 
-  registerPairCallSids(pairId, { agentCallSid, clientCallSid: peerCall.sid });
+  const clientCallSid = peerCall.sid;
+  registerPair(pairId, {
+    callSidA: agentCallSid,
+    callSidB: clientCallSid,
+    from,
+    to,
+  });
+
   logger.info('[outbound] stream pair started', {
     pairId,
     agentCallSid,
-    clientCallSid: peerCall.sid,
+    clientCallSid,
+    agentPlayback: 'browser',
+    clientPlayback: 'twilio',
   });
 
   const t = setTimeout(() => {
-    const clientLeg = getLeg(pairId, 'client');
+    const clientLeg = getLegByCallSid(clientCallSid);
     if (!clientLeg?.streamSid) {
-      logger.warn('[outbound] client stream timed out', { pairId });
-      hangUp(getLeg(pairId, 'agent')?.callSid || agentCallSid);
-      hangUp(clientLeg?.callSid || peerCall.sid);
+      logger.warn('[outbound] client stream timed out', { pairId, clientCallSid });
+      hangUp(agentCallSid);
+      hangUp(clientCallSid);
       removePair(pairId);
     }
   }, DIAL_TIMEOUT_MS);
   if (typeof t.unref === 'function') t.unref();
 
-  return buildLegTwiML({ pairId, role: 'agent' });
+  return buildLegTwiML({
+    pairId,
+    peerCallSid: clientCallSid,
+    ...LANGUAGE_PAIRS.agent,
+    langPreset: 'agent',
+    playback: 'browser',
+  });
 };
 
-/** @deprecated Use buildLegTwiML */
-const streamTwiml = (pairId, role) => buildLegTwiML({ pairId, role });
+/**
+ * @deprecated Prefer buildLegTwiML with peerCallSid + playback
+ */
+const streamTwiml = (pairId, langPreset, peerCallSid = 'PEER_PENDING') =>
+  buildLegTwiML({
+    pairId,
+    peerCallSid,
+    langPreset,
+    playback: langPreset === 'agent' ? 'browser' : 'twilio',
+  });
 
 module.exports = {
   buildLegTwiML,

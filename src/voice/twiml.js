@@ -5,27 +5,38 @@ const { VoiceResponse } = Twilio.twiml;
 
 /**
  * Builds Connect/Stream TwiML for one call leg.
- * Language pair is embedded in custom parameters so each leg is deterministic.
  *
  * @param {object} params
  * @param {string} params.pairId
- * @param {'agent'|'client'} params.role
+ * @param {string} params.peerCallSid
  * @param {string} [params.sourceLanguage]
  * @param {string} [params.targetLanguage]
+ * @param {'browser'|'twilio'} [params.playback]
+ *   browser = Voice SDK agent (mic only on Twilio; TTS via /agent-playback)
+ *   twilio  = PSTN client (TTS injected on this Connect/Stream)
+ * @param {'agent'|'client'} [params.langPreset]
  * @returns {string}
  */
-const buildLegTwiML = ({ pairId, role, sourceLanguage, targetLanguage }) => {
+const buildLegTwiML = ({
+  pairId,
+  peerCallSid,
+  sourceLanguage,
+  targetLanguage,
+  playback = 'twilio',
+  langPreset,
+}) => {
   const langs =
     sourceLanguage && targetLanguage
       ? { sourceLanguage, targetLanguage }
-      : role === 'agent'
-        ? LANGUAGE_PAIRS.agent
-        : LANGUAGE_PAIRS.client;
+      : langPreset === 'client'
+        ? LANGUAGE_PAIRS.client
+        : LANGUAGE_PAIRS.agent;
 
   const twiml = new VoiceResponse();
   const stream = twiml.connect().stream({ url: getMediaStreamUrl() });
   stream.parameter({ name: 'pairId', value: String(pairId) });
-  stream.parameter({ name: 'role', value: String(role) });
+  stream.parameter({ name: 'peerCallSid', value: String(peerCallSid) });
+  stream.parameter({ name: 'playback', value: String(playback) });
   stream.parameter({ name: 'sourceLanguage', value: String(langs.sourceLanguage) });
   stream.parameter({ name: 'targetLanguage', value: String(langs.targetLanguage) });
   return twiml.toString();

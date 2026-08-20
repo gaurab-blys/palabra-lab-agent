@@ -16,28 +16,28 @@ router.get('/health', (_req, res) => {
  * QA helper for TC-06: drop Palabra WebSocket(s) on the live call without hanging up Twilio.
  * The session reconnects (up to 3 times) or fails open — the phone call stays up.
  *
- * POST /debug/drop-palabra?role=agent|client|both
+ * POST /debug/drop-palabra?callSid=CAxxx  (optional — omit to drop all legs)
  */
 router.post('/debug/drop-palabra', (req, res) => {
-  const role = String(req.query.role || 'both');
-  if (!['agent', 'client', 'both'].includes(role)) {
-    res.status(400).json({ error: 'role must be agent, client, or both' });
-    return;
-  }
+  const onlyCallSid = req.query.callSid ? String(req.query.callSid) : null;
 
   const dropped = [];
   listPairs().forEach((pair) => {
-    ['agent', 'client'].forEach((leg) => {
-      if (role !== 'both' && role !== leg) return;
-      const session = pair[leg] && pair[leg].session;
+    (pair.legs || []).forEach((leg) => {
+      if (onlyCallSid && leg.callSid !== onlyCallSid) return;
+      const session = leg.session;
       if (!session || typeof session.forceClose !== 'function') return;
       session.forceClose();
-      dropped.push({ pairId: pair.pairId, role: leg, callSid: pair[leg].callSid });
+      dropped.push({
+        pairId: pair.pairId,
+        callSid: leg.callSid,
+        peerCallSid: leg.peerCallSid,
+      });
     });
   });
 
-  logger.warn('[debug] Palabra WebSocket force-closed', { role, dropped });
-  res.json({ ok: true, role, dropped });
+  logger.warn('[debug] Palabra WebSocket force-closed', { onlyCallSid, dropped });
+  res.json({ ok: true, dropped });
 });
 
 /** Built-in browser agent (standalone — no NAP required). */

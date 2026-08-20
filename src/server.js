@@ -26,4 +26,5 @@ server.listen(config.PORT, () => {
   logger.info(`[server] listening on port ${config.PORT}`);
   logger.info('[server] voice webhook', { path: config.VOICE_WEBHOOK_PATH });
   logger.info('[server] media stream', { path: config.MEDIA_STREAM_PATH });
+  logger.info('[server] agent playback', { path: config.AGENT_PLAYBACK_PATH });
 });

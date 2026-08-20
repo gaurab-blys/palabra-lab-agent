@@ -1,19 +1,23 @@
-const byCallSid = new Map();
-const byPairRole = new Map();
-const pairMeta = new Map();
+/**
+ * Pair registry keyed by Twilio CallSid.
+ *
+ * playback:
+ * - 'twilio'  — PSTN leg; TTS is injected onto that Connect/Stream WebSocket
+ * - 'browser' — Voice SDK agent; TTS is NEVER injected on the Twilio call
+ *               (played in the browser over /agent-playback instead)
+ */
 
-const roleOpposite = (role) =>
-  role === 'agent' ? 'client' : role === 'client' ? 'agent' : undefined;
+const byCallSid = new Map();
+const pairMeta = new Map();
 
 const emptyPairMeta = () => ({
   bothLegsReady: false,
-  ttsQueueFor: { agent: [], client: [] },
+  from: undefined,
+  to: undefined,
 });
 
 /**
- * Returns pair-level metadata (TTS queues, pairing flags).
  * @param {string} pairId
- * @returns {{ bothLegsReady: boolean, ttsQueueFor: { agent: Buffer[], client: Buffer[] } }}
  */
 const getPairMeta = (pairId) => {
   if (!pairId) return emptyPairMeta();
@@ -22,72 +26,96 @@ const getPairMeta = (pairId) => {
 };
 
 /**
- * Registers or updates one media-stream leg.
- * Mirrors conversationrelay-translation-lab sessionStore.upsertLeg.
- *
  * @param {object} params
  * @param {string} params.pairId
- * @param {'agent'|'client'} params.role
- * @param {string} [params.callSid]
+ * @param {string} params.callSid
+ * @param {string} [params.peerCallSid]
  * @param {string} [params.streamSid]
  * @param {string} [params.sourceLanguage]
  * @param {string} [params.targetLanguage]
+ * @param {'twilio'|'browser'} [params.playback]
  * @param {import('ws').WebSocket} [params.ws]
+ * @param {import('ws').WebSocket|null} [params.browserWs]
  * @param {object} [params.session]
- * @param {number} [params.suppressOutboundUntil]
+ * @param {number} [params.suppressInboundUntil]
  */
 const upsertLeg = ({
   pairId,
-  role,
   callSid,
+  peerCallSid,
   streamSid,
   sourceLanguage,
   targetLanguage,
+  playback,
   ws,
+  browserWs,
   session,
-  suppressOutboundUntil,
+  suppressInboundUntil,
 }) => {
-  if (!pairId || (role !== 'agent' && role !== 'client')) return undefined;
+  if (!pairId || !callSid) return undefined;
 
-  const key = `${pairId}:${role}`;
-  const existing = byPairRole.get(key);
+  const existing = byCallSid.get(callSid);
 
   const entry = {
     pairId,
-    role,
-    callSid: callSid || existing?.callSid,
+    callSid,
+    peerCallSid: peerCallSid || existing?.peerCallSid,
     streamSid: streamSid !== undefined ? streamSid : existing?.streamSid,
     sourceLanguage: sourceLanguage || existing?.sourceLanguage,
     targetLanguage: targetLanguage || existing?.targetLanguage,
+    playback: playback || existing?.playback || 'twilio',
     ws: ws !== undefined ? ws : existing?.ws,
+    browserWs: browserWs !== undefined ? browserWs : existing?.browserWs,
     session: session !== undefined ? session : existing?.session,
-    suppressOutboundUntil:
-      suppressOutboundUntil !== undefined
-        ? suppressOutboundUntil
-        : existing?.suppressOutboundUntil,
+    suppressInboundUntil:
+      suppressInboundUntil !== undefined
+        ? suppressInboundUntil
+        : existing?.suppressInboundUntil,
   };
 
-  byPairRole.set(key, entry);
-  if (entry.callSid) byCallSid.set(entry.callSid, entry);
+  byCallSid.set(callSid, entry);
   getPairMeta(pairId);
   return entry;
 };
 
 /**
- * Pre-registers CallSids for a pair before media streams connect.
  * @param {string} pairId
- * @param {{ agentCallSid?: string, clientCallSid?: string }} fields
+ * @param {{ callSidA: string, callSidB: string, from?: string, to?: string }} params
  */
-const registerPairCallSids = (pairId, { agentCallSid, clientCallSid } = {}) => {
-  if (agentCallSid) upsertLeg({ pairId, role: 'agent', callSid: agentCallSid });
-  if (clientCallSid) upsertLeg({ pairId, role: 'client', callSid: clientCallSid });
+const registerPair = (pairId, { callSidA, callSidB, from, to } = {}) => {
+  if (!pairId || !callSidA || !callSidB || callSidA === callSidB) return;
+  upsertLeg({
+    pairId,
+    callSid: callSidA,
+    peerCallSid: callSidB,
+    playback: 'browser',
+  });
+  upsertLeg({
+    pairId,
+    callSid: callSidB,
+    peerCallSid: callSidA,
+    playback: 'twilio',
+  });
+  const meta = getPairMeta(pairId);
+  if (from) meta.from = from;
+  if (to) meta.to = to;
 };
 
 /**
- * @param {string} pairId
- * @param {'agent'|'client'} role
+ * Finds the browser (agent) leg for a dialed from/to pair.
+ * @param {string} from
+ * @param {string} to
  */
-const getLeg = (pairId, role) => byPairRole.get(`${pairId}:${role}`);
+const findBrowserLegByDial = (from, to) => {
+  if (!from || !to) return undefined;
+  for (const metaEntry of pairMeta.entries()) {
+    const [pairId, meta] = metaEntry;
+    if (meta.from !== from || meta.to !== to) continue;
+    const legs = [...byCallSid.values()].filter((l) => l.pairId === pairId);
+    return legs.find((l) => l.playback === 'browser');
+  }
+  return undefined;
+};
 
 /**
  * @param {string} callSid
@@ -95,82 +123,92 @@ const getLeg = (pairId, role) => byPairRole.get(`${pairId}:${role}`);
 const getLegByCallSid = (callSid) => byCallSid.get(callSid);
 
 /**
- * Gets the opposite leg for a given callSid.
  * @param {string} callSid
  */
-const getOppositeLegByCallSid = (callSid) => {
-  const entry = byCallSid.get(callSid);
-  if (!entry) return undefined;
-  const opposite = roleOpposite(entry.role);
-  if (!opposite) return undefined;
-  return byPairRole.get(`${entry.pairId}:${opposite}`);
+const getPeerByCallSid = (callSid) => {
+  const self = byCallSid.get(callSid);
+  if (!self?.peerCallSid) return undefined;
+  return byCallSid.get(self.peerCallSid);
 };
 
 /**
- * Clears live WS/stream/session fields while keeping leg metadata for reconnect.
  * @param {string} callSid
  */
 const detachLegByCallSid = (callSid) => {
   const entry = byCallSid.get(callSid);
   if (!entry) return;
 
-  const updated = {
+  byCallSid.set(callSid, {
     ...entry,
     ws: null,
     streamSid: undefined,
     session: undefined,
-    suppressOutboundUntil: undefined,
-  };
-
-  byPairRole.set(`${entry.pairId}:${entry.role}`, updated);
-  byCallSid.set(callSid, updated);
+    suppressInboundUntil: undefined,
+    // keep browserWs so playback can survive brief media reconnects
+  });
 };
 
 /**
- * Removes a pair and all leg mappings.
  * @param {string} pairId
  */
 const removePair = (pairId) => {
-  ['agent', 'client'].forEach((role) => {
-    const entry = byPairRole.get(`${pairId}:${role}`);
-    if (entry?.callSid) byCallSid.delete(entry.callSid);
-    byPairRole.delete(`${pairId}:${role}`);
-  });
+  if (!pairId) return;
+  [...byCallSid.values()]
+    .filter((leg) => leg.pairId === pairId)
+    .forEach((leg) => {
+      if (leg.browserWs && leg.browserWs.readyState === 1) {
+        try {
+          leg.browserWs.close();
+        } catch (_e) {
+          // ignore
+        }
+      }
+      byCallSid.delete(leg.callSid);
+    });
   pairMeta.delete(pairId);
 };
 
 /**
- * Returns every active pair with both legs and pair metadata.
  * @returns {object[]}
  */
 const listPairs = () => {
-  const pairIds = new Set();
-  byPairRole.forEach((entry) => pairIds.add(entry.pairId));
+  const byPair = new Map();
+  byCallSid.forEach((leg) => {
+    if (!byPair.has(leg.pairId)) byPair.set(leg.pairId, []);
+    byPair.get(leg.pairId).push(leg);
+  });
 
-  return [...pairIds].map((pairId) => ({
+  return [...byPair.entries()].map(([pairId, legs]) => ({
     pairId,
-    agent: getLeg(pairId, 'agent') || {},
-    client: getLeg(pairId, 'client') || {},
+    legs,
     meta: getPairMeta(pairId),
   }));
 };
 
-/**
- * Backward-compatible registry surface used by tests and debug routes.
- */
 const registry = {
-  registerPair: registerPairCallSids,
-  attachLeg: (pairId, role, fields = {}) => upsertLeg({ pairId, role, ...fields }),
+  registerPair: (pairId, fields = {}) => {
+    if (fields.callSidA && fields.callSidB) {
+      registerPair(pairId, fields);
+      return;
+    }
+    if (fields.agentCallSid && fields.clientCallSid) {
+      registerPair(pairId, {
+        callSidA: fields.agentCallSid,
+        callSidB: fields.clientCallSid,
+        from: fields.from,
+        to: fields.to,
+      });
+    }
+  },
+  attachLeg: (pairId, _unused, fields = {}) => {
+    const callSid = fields.callSid;
+    if (!callSid) return undefined;
+    return upsertLeg({ pairId, ...fields, callSid });
+  },
   getPair: (pairId) => {
-    const agent = getLeg(pairId, 'agent');
-    const client = getLeg(pairId, 'client');
-    if (!agent && !client) return undefined;
-    return {
-      pairId,
-      agent: agent || {},
-      client: client || {},
-      ...getPairMeta(pairId),
-    };
+    const legs = [...byCallSid.values()].filter((l) => l.pairId === pairId);
+    if (!legs.length) return undefined;
+    return { pairId, legs, ...getPairMeta(pairId) };
   },
   get: getLegByCallSid,
   setSession: (callSid, session) => {
@@ -188,10 +226,10 @@ const registry = {
 
 module.exports = {
   upsertLeg,
-  registerPairCallSids,
-  getLeg,
+  registerPair,
+  findBrowserLegByDial,
   getLegByCallSid,
-  getOppositeLegByCallSid,
+  getPeerByCallSid,
   detachLegByCallSid,
   getPairMeta,
   removePair,

@@ -154,7 +154,7 @@ describe('mediaStream', () => {
     expect(createSession).not.toHaveBeenCalled();
   });
 
-  it('forwards inbound mic to Palabra only after both legs are live', () => {
+  it('forwards inbound mic to Palabra when both legs are live', () => {
     const { agentWs } = pairBothLegs();
     mockSession.sendAudio.mockClear();
 
@@ -203,7 +203,7 @@ describe('mediaStream', () => {
     expect(msg.payload).toBeTruthy();
   });
 
-  it('does not feed mic to Palabra until peer leg is live', () => {
+  it('feeds mic to Palabra before peer joins (keeps session alive); holds TTS until peer is live', () => {
     const agentWs = createFakeWs();
     const clientWs = createFakeWs();
     registry.registerPair('PAIR1', { agentCallSid: 'CA_AGENT', clientCallSid: 'CA_CLIENT' });
@@ -228,7 +228,16 @@ describe('mediaStream', () => {
       'message',
       JSON.stringify({ event: 'media', media: { track: 'inbound', payload: fullChunkPayload } })
     );
-    expect(mockSession.sendAudio).not.toHaveBeenCalled();
+    expect(mockSession.sendAudio).toHaveBeenCalledTimes(1);
+    expect(agentWs.send).not.toHaveBeenCalled();
+
+    const agentOutput = createSession.mock.calls[0][0].onOutputAudio;
+    agentOutput({
+      transcriptionId: 'early-utt',
+      base64Audio: Buffer.alloc(320, 0).toString('base64'),
+      lastChunk: false,
+    });
+    expect(clientWs.send).not.toHaveBeenCalled();
     expect(agentWs.send).not.toHaveBeenCalled();
   });
 

@@ -21,12 +21,15 @@ const TERMINAL_CALL_STATUSES = new Set([
 
 /**
  * When one call ends, hang up its peer and clear the pair.
+ * Idempotent with stream cleanup — no-op if the pair is already gone.
  * @param {string} callSid
  */
 const hangUpPeerIfPaired = (callSid) => {
   if (!callSid) return;
   const self = getLegByCallSid(callSid);
   const peer = getPeerByCallSid(callSid);
+  if (!self && !peer) return;
+
   const peerCallSid = peer?.callSid;
   const pairId = self?.pairId || peer?.pairId;
 

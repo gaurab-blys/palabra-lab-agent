@@ -160,8 +160,10 @@ const handleConnection = (ws) => {
 
   const flushMicToPalabra = () => {
     if (!state.session) return;
-    if (!areBothLegsLive(state.pairId, state.callSid, state.peerCallSid)) return;
 
+    // Always feed Palabra once the session exists. Gating mic until the peer
+    // joins left the agent session silent after `task ready` and stalled ASR.
+    // TTS delivery stays gated in sendTranslatedAudioToPeer.
     while (state.buffer.length >= CHUNK_BYTES) {
       const muLaw = Buffer.from(state.buffer.splice(0, CHUNK_BYTES));
       const pcm8k = muLawBufferToPcm16(muLaw);
@@ -392,9 +394,8 @@ const handleConnection = (ws) => {
       });
     }
 
-    if (!areBothLegsLive(state.pairId, state.callSid, state.peerCallSid)) {
-      return;
-    }
+    // Unlock logging only — do not drop mic while waiting for the peer.
+    areBothLegsLive(state.pairId, state.callSid, state.peerCallSid);
 
     state.buffer.push(...Buffer.from(msg.media.payload, 'base64'));
     flushMicToPalabra();

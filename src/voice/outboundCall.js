@@ -54,7 +54,8 @@ const startOutboundPair = async ({ from, to, agentCallSid }) => {
         playback: 'twilio',
       }),
       statusCallback,
-      statusCallbackEvent: ['completed', 'busy', 'no-answer', 'canceled', 'failed'],
+      // Twilio Calls API only accepts: initiated | ringing | answered | completed
+      statusCallbackEvent: ['completed'],
       statusCallbackMethod: 'POST',
     });
   } catch (err) {
